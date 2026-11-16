@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Face Tag — age and name from live video</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --line:#2a303a; --text:#e8ebf0; --dim:#9aa3b2; --accent:#3ddc97; --warn:#ffb454; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  p.sub { margin:0 0 14px; color:var(--dim); font-size:14px; }
+  .stage { position:relative; background:#000; border:1px solid var(--line); border-radius:14px; overflow:hidden; aspect-ratio:4/3; }
+  .stage video, .stage canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  .stage video.mirror { transform:scaleX(-1); }
+  .stage canvas { cursor:pointer; touch-action:manipulation; }
+  .placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px; color:var(--dim); font-size:15px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+  button { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 14px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06281a; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.small { padding:5px 10px; font-size:13px; }
+  #status { font-size:14px; color:var(--dim); min-height:1.45em; }
+  #status.warn { color:var(--warn); } #status.bad { color:var(--bad); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-top:14px; }
+  section h2 { font-size:15px; margin:0 0 8px; }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:8px 0; border-top:1px solid var(--line); }
+  li:first-child { border-top:0; }
+  li span.n { font-weight:600; overflow-wrap:anywhere; }
+  li span.c { color:var(--dim); font-size:13px; white-space:nowrap; }
+  .empty { color:var(--dim); font-size:14px; }
+  .sheet { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:flex-end; justify-content:center; z-index:10; }
+  .sheet.open { display:flex; }
+  .sheet form { width:100%; max-width:480px; background:var(--panel); border:1px solid var(--line); border-radius:16px 16px 0 0; padding:18px; }
+  .sheet label { display:block; font-weight:600; margin-bottom:8px; }
+  .sheet input { width:100%; font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .sheet .row { justify-content:flex-end; margin-bottom:0; }
+  .note { color:var(--dim); font-size:13px; margin-top:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Face Tag</h1>
+  <p class="sub">Estimates age from the live camera and tags faces you have named.</p>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div class="placeholder" id="placeholder">Press “Start camera”. Tap a face in the picture to give it a name.</div>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="startBtn">Start camera</button>
+    <button id="flipBtn" disabled>Switch camera</button>
+    <button id="nameBtn" disabled>Name this face</button>
+  </div>
+  <div id="status">Loading face models…</div>
+
+  <section>
+    <h2>Remembered faces</h2>
+    <ul id="people"></ul>
+    <div class="empty" id="empty">Nobody saved yet.</div>
+    <div class="row" style="margin-bottom:0"><button class="small" id="clearBtn" hidden>Forget everyone</button></div>
+  </section>
+
+  <p class="note">Everything runs in this browser. Video never leaves the device, and saved faces are stored only here as numeric signatures, not photos. Age is a rough estimate and can be off by several years; save the same person two or three times, in different light, for steadier name tags.</p>
+</main>
+
+<div class="sheet" id="sheet">
+  <form id="nameForm" autocomplete="off">
+    <label for="nameInput">Who is this?</label>
+    <input id="nameInput" maxlength="40" placeholder="Name" required>
+    <div class="row" style="margin-top:12px">
+      <button type="button" id="cancelBtn">Cancel</button>
+      <button type="submit" class="primary">Save face</button>
+    </div>
+  </form>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
+<script>
+(function () {
+  'use strict';
+  var MODEL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model';
+  var STORE = 'face-tag-people-v1';
+  var MATCH = 0.5;          // smaller = stricter name matching
+  var MAX_SAMPLES = 8;      // signatures kept per person
+
+  var $ = function (id) { return document.getElementById(id); };
+  var video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+  var statusEl = $('status'), stage = $('stage');
+
+  var people = {};          // name -> array of Float32Array(128)
+  var faces = [];           // latest detections, in display coordinates
+  var tracks = [];          // for smoothing the age reading
+  var stream = null, facing = 'user', running = false, modelsReady = false, pending = null;
+
+  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+
+  /* ---------- storage ---------- */
+  function load() {
+    try {
+      var raw = JSON.parse(localStorage.getItem(STORE) || '{}');
+      Object.keys(raw).forEach(function (n) {
+        people[n] = raw[n].map(function (a) { return new Float32Array(a); });
+      });
+    } catch (e) { /* start empty */ }
+  }
+  function save() {
+    try {
+      var out = {};
+      Object.keys(people).forEach(function (n) {
+        out[n] = people[n].map(function (d) { return Array.from(d, function (v) { return Math.round(v * 1e4) / 1e4; }); });
+      });
+      localStorage.setItem(STORE, JSON.stringify(out));
+      return true;
+    } catch (e) { return false; }
+  }
+  function renderPeople() {
+    var ul = $('people'), names = Object.keys(people).sort();
+    ul.textContent = '';
+    names.forEach(function (n) {
+      var li = document.createElement('li');
+      var left = document.createElement('span'); left.className = 'n'; left.textContent = n;
+      var right = document.createElement('span');
+      var c = document.createElement('span'); c.className = 'c';
+      c.textContent = people[n].length + (people[n].length === 1 ? ' sample ' : ' samples ');
+      var b = document.createElement('button'); b.className = 'small'; b.textContent = 'Forget';
+      b.addEventListener('click', function () { delete people[n]; save(); renderPeople(); });
+      right.appendChild(c); right.appendChild(b);
+      li.appendChild(left); li.appendChild(right); ul.appendChild(li);
+    });
+    $('empty').hidden = names.length > 0;
+    $('clearBtn').hidden = names.length === 0;
+  }
+
+  /* ---------- recognition ---------- */
+  function dist(a, b) {
+    var s = 0;
+    for (var i = 0; i < a.length; i++) { var d = a[i] - b[i]; s += d * d; }
+    return Math.sqrt(s);
+  }
+  function identify(desc) {
+    var best = null, bestD = MATCH;
+    Object.keys(people).forEach(function (n) {
+      people[n].forEach(function (s) {
+        var d = dist(desc, s);
+        if (d < bestD) { bestD = d; best = n; }
+      });
+    });
+    return best;
+  }
+  function smoothAge(cx, cy, size, age, now) {
+    var hit = null, hitD = size;      // must be within one face-width of the old position
+    tracks.forEach(function (t) {
+      var d = Math.hypot(t.cx - cx, t.cy - cy);
+      if (d < hitD) { hitD = d; hit = t; }
+    });
+    if (!hit) { hit = { age: age }; tracks.push(hit); }
+    else { hit.age = hit.age * 0.85 + age * 0.15; }
+    hit.cx = cx; hit.cy = cy; hit.seen = now;
+    return hit.age;
+  }
+
+  /* ---------- drawing ---------- */
+  function draw() {
+    var W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    var fs = Math.max(14, Math.round(W / 30));
+    ctx.font = '600 ' + fs + 'px system-ui, sans-serif';
+    ctx.textBaseline = 'middle';
+    faces.forEach(function (f) {
+      var color = f.name ? '#3ddc97' : '#ffb454';
+      ctx.lineWidth = Math.max(2, W / 260);
+      ctx.strokeStyle = color;
+      ctx.strokeRect(f.x, f.y, f.w, f.h);
+      var label = (f.name || 'Unknown') + ' · ~' + Math.round(f.age) + ' yrs';
+      var tw = ctx.measureText(label).width + fs * 0.8, th = fs * 1.5;
+      var lx = Math.min(Math.max(0, f.x), W - tw);
+      var ly = f.y - th >= 0 ? f.y - th : f.y + f.h;
+      ctx.fillStyle = color;
+      ctx.fillRect(lx, ly, tw, th);
+      ctx.fillStyle = '#06140d';
+      ctx.fillText(label, lx + fs * 0.4, ly + th / 2);
+    });
+  }
+
+  /* ---------- detection loop ---------- */
+  async function loop() {
+    if (!running) return;
+    if (video.readyState >= 2 && video.videoWidth) {
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        stage.style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+      }
+      try {
+        var opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+        var res = await faceapi.detectAllFaces(video, opts).withFaceLandmarks(true).withAgeAndGender().withFaceDescriptors();
+        var now = performance.now(), W = canvas.width, mirror = facing === 'user';
+        faces = res.map(function (r) {
+          var b = r.detection.box;
+          var x = mirror ? W - b.x - b.width : b.x;
+          return {
+            x: x, y: b.y, w: b.width, h: b.height,
+            age: smoothAge(x + b.width / 2, b.y + b.height / 2, b.width, r.age, now),
+            name: identify(r.descriptor),
+            desc: r.descriptor
+          };
+        });
+        tracks = tracks.filter(function (t) { return now - t.seen < 1500; });
+        draw();
+        $('nameBtn').disabled = faces.length === 0;
+        setStatus(faces.length === 0 ? 'No face in view.' :
+          faces.length + (faces.length === 1 ? ' face' : ' faces') + ' in view. Tap one to name it.');
+      } catch (e) {
+        setStatus('Detection error: ' + (e && e.message ? e.message : e), 'bad');
+      }
+    }
+    setTimeout(loop, 60);
+  }
+
+  /* ---------- camera ---------- */
+  function stopCamera() {
+    running = false;
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+  }
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('This page has no camera access here. Open it from an https:// address or from localhost.', 'bad');
+      return;
+    }
+    stopCamera();
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }
+      });
+    } catch (e) {
+      setStatus('Camera could not start: ' + (e && e.name === 'NotAllowedError' ? 'permission was refused.' : (e && e.message) || e), 'bad');
+      return;
+    }
+    video.srcObject = stream;
+    video.classList.toggle('mirror', facing === 'user');
+    try { await video.play(); } catch (e) { /* autoplay will pick it up */ }
+    $('placeholder').hidden = true;
+    $('placeholder').style.display = 'none';
+    $('startBtn').textContent = 'Restart camera';
+    $('flipBtn').disabled = false;
+    faces = []; tracks = [];
+    running = true;
+    loop();
+  }
+
+  /* ---------- naming ---------- */
+  function openSheet(face) {
+    pending = new Float32Array(face.desc);
+    $('nameInput').value = face.name || '';
+    $('sheet').classList.add('open');
+    $('nameInput').focus();
+  }
+  function closeSheet() { $('sheet').classList.remove('open'); pending = null; }
+
+  canvas.addEventListener('click', function (ev) {
+    if (!faces.length) return;
+    var r = canvas.getBoundingClientRect();
+    var x = (ev.clientX - r.left) * canvas.width / r.width;
+    var y = (ev.clientY - r.top) * canvas.height / r.height;
+    var hit = faces.filter(function (f) { return x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h; })[0];
+    if (hit) openSheet(hit);
+  });
+  $('nameBtn').addEventListener('click', function () {
+    if (!faces.length) return;
+    var biggest = faces.slice().sort(function (a, b) { return b.w * b.h - a.w * a.h; })[0];
+    openSheet(biggest);
+  });
+  $('cancelBtn').addEventListener('click', closeSheet);
+  $('sheet').addEventListener('click', function (ev) { if (ev.target === $('sheet')) closeSheet(); });
+  $('nameForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var name = $('nameInput').value.trim();
+    if (!name || !pending) return;
+    if (!people[name]) people[name] = [];
+    people[name].push(pending);
+    if (people[name].length > MAX_SAMPLES) people[name].shift();
+    var kept = save();
+    renderPeople();
+    closeSheet();
+    if (!kept) setStatus('Saved for now, but this browser would not store it, so it will be lost on reload.', 'warn');
+  });
+  $('clearBtn').addEventListener('click', function () {
+    var b = $('clearBtn');
+    if (b.dataset.sure) { people = {}; save(); renderPeople(); delete b.dataset.sure; b.textContent = 'Forget everyone'; }
+    else { b.dataset.sure = '1'; b.textContent = 'Tap again to forget everyone'; setTimeout(function () { delete b.dataset.sure; b.textContent = 'Forget everyone'; }, 3000); }
+  });
+
+  $('startBtn').addEventListener('click', function () {
+    if (!modelsReady) { setStatus('Face models are still loading, one moment…', 'warn'); return; }
+    startCamera();
+  });
+  $('flipBtn').addEventListener('click', function () {
+    facing = facing === 'user' ? 'environment' : 'user';
+    startCamera();
+  });
+
+  /* ---------- boot ---------- */
+  load(); renderPeople();
+  if (typeof faceapi === 'undefined') {
+    setStatus('The face library did not load. Check the internet connection and reload.', 'bad');
+    return;
+  }
+  Promise.all([
+    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL),
+    faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL),
+    faceapi.nets.ageGenderNet.loadFromUri(MODEL),
+    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL)
+  ]).then(function () {
+    modelsReady = true;
+    setStatus('Ready. Press “Start camera”.');
+  }).catch(function (e) {
+    setStatus('Face models could not load (' + ((e && e.message) || e) + '). Check the internet connection and reload.', 'bad');
+  });
+})();
+</script>
+</body>
+</html>
