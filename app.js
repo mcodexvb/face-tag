@@ -233,6 +233,20 @@
     ready = true; pill();
   }
 
+  // Opt-in via ?detector=scrfd. Preserve native mesh for live effects.
+  var useScrfd = new URLSearchParams(location.search).get('detector') === 'scrfd';
+  var scrfdFailed = false;
+  async function detectFaces(src, limit, requireMesh) {
+    if (useScrfd && !scrfdFailed && !requireMesh && window.SCRFD) {
+      try {
+        return await window.SCRFD.detect(src, {limit:limit});
+      } catch (e) {
+        scrfdFailed = true;
+        console.warn('SCRFD unavailable; falling back to BlazeFace', e);
+      }
+    }
+    return humanA.detect(src);
+  }
   /* ================= multi-face tracker ================= */
   function iou(a, b) {
     var x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y), x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
@@ -538,7 +552,7 @@
         var vw = video.videoWidth, vh = video.videoHeight;
         if (canvas.width !== vw || canvas.height !== vh) { canvas.width = vw; canvas.height = vh; stage.style.aspectRatio = vw + ' / ' + vh; }
         var wantMesh = !!S.showMesh || !!fxOn(); if (humanA.config.face.mesh.enabled !== wantMesh) humanA.config.face.mesh.enabled = wantMesh;
-        var t0 = performance.now(), res = await humanA.detect(video);
+        var t0 = performance.now(), res = await detectFaces(video, 12, wantMesh);
         if (!running || gen !== loopGen) return;
         var now = performance.now(), dtMs = lastFrame ? now - lastFrame : 0;
         if (lastFrame) { var inst = 1000 / (now - lastFrame); fps = fps ? fps * 0.8 + inst * 0.2 : inst; } lastFrame = now;
@@ -591,7 +605,7 @@
   }
   async function analysePhoto(c, label) {
     humanA.config.face.detector.maxDetected = 40; humanA.config.face.mesh.enabled = true;          // the mesh lets effects work on photos too
-    var res; try { res = await humanA.detect(c); } finally { humanA.config.face.detector.maxDetected = 12; }
+    var res; try { res = await detectFaces(c, 40, true); } finally { humanA.config.face.detector.maxDetected = 12; }
     var dets = toDets(res.face), list = [], now = performance.now();
     for (var i = 0; i < dets.length; i++) {
       status(label + 'reading face ' + (i + 1) + ' of ' + dets.length + '…');
