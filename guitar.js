@@ -9,10 +9,10 @@
   var CDN_MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/human-models@3.0.4/models/';
   var MODELS = location.protocol === 'file:' ? CDN_MODELS : './models/';
   var Q = new URLSearchParams(location.search), FORCE_BACKEND = Q.get('backend'), WASM_PATH = Q.get('wasm');   // for testing
-  var MP_PATH = 'lib/mediapipe-hands/', VERSION = '7';
+  var MP_PATH = 'lib/mediapipe-hands/', VERSION = '8';
 
   var DEFAULTS = { mode: 'strings', tone: 'acoustic', scale: 'minpent', key: 9, names: 'western', chords: 'pop',
-                   snap: true, skeleton: true, reverb: true, lefty: false, quality: 'full' };
+                   snap: true, skeleton: true, reverb: true, lefty: false, quality: 'full', keys: 'piano', octave: 48, sustain: false };
   var S = Object.assign({}, DEFAULTS);
   try { Object.assign(S, JSON.parse(localStorage.getItem('airguitar-v1') || '{}')); } catch (e) {}
   function saveS() { try { localStorage.setItem('airguitar-v1', JSON.stringify(S)); } catch (e) {} }
@@ -72,7 +72,7 @@
     return WEST[pc] + (Math.floor(r / 12) - 1);
   }
   function hueOf(m) { return Math.round((((Math.round(m) % 12) + 12) % 12) * 30 + 160) % 360; }
-  function setSize(w, h) { if (w === W && h === H) return; W = w; H = h; DIAG = Math.hypot(W, H); canvas.width = W; canvas.height = H; $('stage').style.aspectRatio = W + ' / ' + H; layoutStrum(); }
+  function setSize(w, h) { if (w === W && h === H) return; W = w; H = h; DIAG = Math.hypot(W, H); canvas.width = W; canvas.height = H; $('stage').style.aspectRatio = W + ' / ' + H; layoutAll(); }
 
   /* ================= pitch from string length ================= */
   /* A real string's pitch is inversely proportional to its length: f ∝ 1/L. The longest
@@ -106,6 +106,7 @@
     try { recDest = ac.createMediaStreamDestination(); comp.connect(recDest); } catch (e) { recDest = null; }
     applyTone();
     if (ac.state === 'suspended') ac.resume();
+    prewarm();
   }
   function impulse(sec) {
     var sr = ac.sampleRate, n = Math.floor(sr * sec), b = ac.createBuffer(2, n, sr);
@@ -239,7 +240,7 @@
     var uniq = [];
     info.forEach(function (d) { if (!uniq.some(function (u) { return dist(u.c, d.c) < 0.6 * Math.max(u.s, d.s); })) uniq.push(d); });
     var pairs = [];
-    hands.forEach(function (h, hi) { uniq.forEach(function (d, di) { var dd = dist(h.c, d.c); if (dd < 1.6 * Math.max(h.s, d.s)) pairs.push({ hi: hi, di: di, d: dd }); }); });
+    hands.forEach(function (h, hi) { uniq.forEach(function (d, di) { var dd = dist(h.c, d.c); if (dd < 3.2 * Math.max(h.s, d.s)) pairs.push({ hi: hi, di: di, d: dd }); }); });   // generous: a drum strike can move a hand far between frames; closest pairs are matched first
     pairs.sort(function (a, b) { return a.d - b.d; });
     var usedH = {}, usedD = {};
     pairs.forEach(function (q) { if (usedH[q.hi] || usedD[q.di]) return; usedH[q.hi] = usedD[q.di] = true; updateHand(hands[q.hi], uniq[q.di], now); });
@@ -250,6 +251,7 @@
       for (var i = 0; i < 21; i++) h.filt.push([new OneEuro(mc, beta), new OneEuro(mc, beta)]);
       updateHand(h, d, now); h.prev = null; hands.push(h);
     });
+    hands.forEach(function (h) { if (now - h.seen >= 300) releaseHand(h); });       // a hand that left lets go of its keys
     hands = hands.filter(function (h) { return now - h.seen < 300; });
     var all = hands; hands = all.filter(function (h) { return h.hits >= 2; });
     interact(now); hands = all;
@@ -363,12 +365,408 @@
     hits.forEach(function (h) { pluck(h.s, h.s.strum ? 0.18 + 0.1 * h.s.i / 5 : h.c.u, vel, now, false); });
   }
   function interact(now) {
+    if (S.mode === 'keys') return interactKeys(now);
+    if (S.mode === 'drums') return interactDrums(now);
+    if (S.mode === 'tabla') return interactTabla(now);
+    if (S.mode === 'theremin') return interactTheremin(now);
     if (S.mode === 'strings') interactStrings(now); else interactStrum(now);
     hands.forEach(function (h) {
       if (!h.prev || h.pinch || now - h.releasedAt < 250) return;
       (S.mode === 'strum' ? [8] : [8, 12]).forEach(function (k) { sweep(h.prev[k], h.pts[k], h.dt, now); });   // strumming: one fingertip, like a pick
     });
   }
+
+  /* ================= more instruments: keys, drums, tabla, theremin ================= */
+  var TIPS = [4, 8, 12, 16, 20];
+  var keys = [], keySurf = 0, pads = [], tpads = [], ther = null, therTrail = [], geVoice = null, lastBol = {}, noiseBuf = null;
+  var therState = { tip: null, m: null, vol: 0, vtip: null };
+  var pianoCache = {}, pianoKeys = [], warmQ = [];
+  var PAD_NAMES = { kick: 'Kick', snare: 'Snare', hihat: 'Hi-hat', crash: 'Crash', tom1: 'Tom', tom2: 'Floor tom', ride: 'Ride' };
+  var PAD_HUE = { kick: 0, snare: 210, hihat: 45, crash: 48, ride: 40, tom1: 20, tom2: 28 };
+  function layoutAll() { layoutStrum(); layoutKeys(); layoutPads(); layoutTabla(); }
+  function isBlack(m) { return [1, 3, 6, 8, 10].indexOf(((m % 12) + 12) % 12) >= 0; }
+
+  /* ---------- keys ---------- */
+  function layoutKeys() {
+    var land = W >= H, nWhite = land ? 15 : 10, y0 = H * (land ? 0.6 : 0.68), y1 = H * 0.975, kw = W / nWhite, m = S.octave, wi = 0, whites = [], blacks = [];
+    while (isBlack(m)) m++;
+    while (wi < nWhite) {
+      if (isBlack(m)) blacks.push({ midi: m, black: true, x: wi * kw - kw * 0.31, y: y0, w: kw * 0.62, h: (y1 - y0) * 0.6 });
+      else { whites.push({ midi: m, black: false, x: wi * kw + 1, y: y0, w: kw - 2, h: y1 - y0 }); wi++; }
+      m++;
+    }
+    var old = {}; keys.forEach(function (k) { old[k.midi] = k; });
+    keys = blacks.concat(whites).map(function (k) { var o = old[k.midi]; k.on = o ? o.on : 0; k.t = o ? o.t : 0; return k; });
+    keySurf = y0;
+  }
+  function keyAt(p) { for (var i = 0; i < keys.length; i++) { var k = keys[i]; if (p[0] >= k.x && p[0] <= k.x + k.w && p[1] >= k.y && p[1] <= k.y + k.h) return k; } return null; }
+  /* Piano: additive synthesis. Each overtone is slightly sharp (string stiffness, B grows with pitch),
+     each note has two strings a hair apart (the slow beating of a real piano), and decay is two-stage. */
+  function pianoBuffer(midi) {
+    if (pianoCache[midi]) return pianoCache[midi];
+    var sr = ac.sampleRate, f = mtof(midi), dur = clamp(4.2 - (midi - 40) * 0.05, 1.2, 3.6), n = Math.floor(sr * dur), out = new Float32Array(n);
+    var Bc = 0.00008 * Math.pow(2, (midi - 40) / 12), N = Math.min(14, Math.floor(sr / 2.2 / f)), i, k, u;
+    for (k = 1; k <= N; k++) {
+      var fk = f * k * Math.sqrt(1 + Bc * k * k); if (fk > sr / 2.2) break;
+      var ak = Math.pow(k, -1.15) * Math.exp(-(k - 1) * 0.2), tau = dur * 0.5 / (1 + 0.4 * (k - 1)), t1 = tau * 0.18;
+      for (u = 0; u < 2; u++) {
+        var w = 2 * Math.PI * fk * (u ? 1.0006 : 0.9997) / sr, c = Math.cos(w), s = Math.sin(w), ph = Math.random() * 6.283, re = Math.cos(ph), im = Math.sin(ph);
+        var d1 = Math.exp(-1 / (t1 * sr)), d2 = Math.exp(-1 / (tau * sr)), e1 = 0.32 * ak, e2 = 0.18 * ak;
+        for (i = 0; i < n; i++) { out[i] += (e1 + e2) * im; var nr = re * c - im * s; im = re * s + im * c; re = nr; e1 *= d1; e2 *= d2; }
+      }
+    }
+    var lpY = 0, hn = Math.floor(sr * 0.012);                                // felt hammer thump
+    for (i = 0; i < hn; i++) { lpY = 0.25 * (Math.random() * 2 - 1) + 0.75 * lpY; out[i] += 0.25 * lpY * Math.exp(-i / (0.003 * sr)); }
+    var peak = 0, att = Math.floor(sr * 0.002), fade = Math.floor(sr * 0.05);
+    for (i = 0; i < n; i++) peak = Math.max(peak, Math.abs(out[i]));
+    for (i = 0; i < n; i++) { out[i] *= 0.8 / (peak || 1); if (i < att) out[i] *= i / att; if (i > n - fade) out[i] *= (n - i) / fade; }
+    var b = ac.createBuffer(1, n, sr); b.getChannelData(0).set(out);
+    pianoCache[midi] = b; pianoKeys.push(midi); if (pianoKeys.length > 40) delete pianoCache[pianoKeys.shift()];
+    return b;
+  }
+  function prewarm() {
+    if (!ac || S.mode !== 'keys' || S.keys !== 'piano') return;
+    warmQ = keys.map(function (k) { return k.midi; }).filter(function (m) { return !pianoCache[m]; });
+    (function step() { if (!warmQ.length || S.mode !== 'keys' || S.keys !== 'piano') return; pianoBuffer(warmQ.shift()); setTimeout(step, 40); })();
+  }
+  function mkPan(x) {
+    if (ac.createStereoPanner) { var p = ac.createStereoPanner(); p.pan.value = clamp((x / W) * 2 - 1, -1, 1) * 0.5; p.connect(master); return p; }
+    var g = ac.createGain(); g.connect(master); return g;
+  }
+  function harmoniumVoice(midi, vel, dest) {
+    var t = ac.currentTime, f = mtof(midi), g = ac.createGain(), lpf = ac.createBiquadFilter(), fm = ac.createBiquadFilter();
+    lpf.type = 'lowpass'; lpf.frequency.value = Math.min(6000, f * 9); lpf.Q.value = 0.6;
+    fm.type = 'peaking'; fm.frequency.value = 1250; fm.Q.value = 1.1; fm.gain.value = 6;               // the reed chamber's resonance
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.11 + 0.07 * vel, t + 0.07);
+    var oscs = [['sawtooth', 1, -6, 1], ['sawtooth', 1, 7, 1], ['square', 0.5, 0, 0.35]].map(function (d) {
+      var o = ac.createOscillator(), og = ac.createGain(); o.type = d[0]; o.frequency.value = f * d[1]; o.detune.value = d[2]; og.gain.value = d[3];
+      o.connect(og); og.connect(lpf); o.start(t); return o;
+    });
+    var lfo = ac.createOscillator(), lg = ac.createGain(); lfo.frequency.value = 5.2; lg.gain.value = 0.01; lfo.connect(lg); lg.connect(g.gain); lfo.start(t); oscs.push(lfo);   // bellows
+    lpf.connect(fm); fm.connect(g); g.connect(dest);
+    return { stop: function () { var t2 = ac.currentTime; g.gain.cancelScheduledValues(t2); g.gain.setTargetAtTime(0, t2, 0.06); oscs.forEach(function (o) { try { o.stop(t2 + 0.5); } catch (e) {} }); } };
+  }
+  function keyNoteOn(k, vel) {
+    k.on++; k.t = performance.now(); stats.plays++; stats.keys = (stats.keys || 0) + 1;
+    if (!ac) return null;
+    var dest = mkPan(k.x + k.w / 2);
+    if (S.keys === 'harmonium') return harmoniumVoice(k.midi, vel, dest);
+    var t = ac.currentTime, src = ac.createBufferSource(), lpf = ac.createBiquadFilter(), g = ac.createGain();
+    src.buffer = pianoBuffer(k.midi); lpf.type = 'lowpass'; lpf.frequency.value = Math.min(16000, mtof(k.midi) * (2.5 + 14 * vel)); g.gain.value = 0.15 + 0.85 * vel * vel;
+    src.connect(lpf); lpf.connect(g); g.connect(dest); src.start(t);
+    return { stop: function () { var t2 = ac.currentTime; g.gain.cancelScheduledValues(t2); g.gain.setTargetAtTime(0, t2, 0.07); try { src.stop(t2 + 0.6); } catch (e) {} } };
+  }
+  function keyNoteOff(k, v) { k.on = Math.max(0, k.on - 1); if (v && !(S.keys === 'piano' && S.sustain)) v.stop(); }
+  function interactKeys(now) {
+    var up = keySurf - 0.015 * H;                                          // hysteresis: lift a little above the line to release
+    hands.forEach(function (h) {
+      h.kd = h.kd || {};
+      TIPS.forEach(function (ti) {
+        var p = h.pts[ti], q = h.prev ? h.prev[ti] : null, st = h.kd[ti], k;
+        if (st) {
+          if (p[1] < up) { keyNoteOff(st.key, st.v); h.kd[ti] = null; return; }
+          k = keyAt(p);
+          if (k && k !== st.key && S.keys === 'harmonium') { keyNoteOff(st.key, st.v); st.key = k; st.v = keyNoteOn(k, st.vel); }   // slide along the keys
+          return;
+        }
+        if (q && q[1] < keySurf && p[1] >= keySurf && (k = keyAt(p))) {
+          var vy = (p[1] - q[1]) / (h.dt / 1000) / H, vel = clamp(0.3 + vy * 0.45, 0.25, 1);
+          h.kd[ti] = { key: k, vel: vel, v: keyNoteOn(k, vel) };
+        }
+      });
+    });
+  }
+  function releaseHand(h) { if (h.kd) Object.keys(h.kd).forEach(function (ti) { var st = h.kd[ti]; if (st) keyNoteOff(st.key, st.v); }); h.kd = {}; }
+  function releaseAll() {
+    hands.forEach(releaseHand);
+    Object.keys(pointers).forEach(function (id) { var q = pointers[id]; if (q.kd) { keyNoteOff(q.kd.key, q.kd.v); q.kd = null; } });
+    keys.forEach(function (k) { k.on = 0; }); therKill(); geVoice = null;
+  }
+
+  /* ---------- shared percussion sound pieces ---------- */
+  function noiseBuffer() {
+    if (noiseBuf) return noiseBuf;
+    var n = ac.sampleRate, b = ac.createBuffer(1, n, ac.sampleRate), d = b.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    return (noiseBuf = b);
+  }
+  function noiseHit(dest, t, type, freq, q, amp, dur) {
+    var s = ac.createBufferSource(), fl = ac.createBiquadFilter(), g = ac.createGain();
+    s.buffer = noiseBuffer(); fl.type = type; fl.frequency.value = freq; fl.Q.value = q;
+    g.gain.setValueAtTime(amp, t); g.gain.exponentialRampToValueAtTime(0.0005, t + dur);
+    s.connect(fl); fl.connect(g); g.connect(dest); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
+  }
+  /* Modal synthesis: a struck drumhead or cymbal as a few decaying sine modes [ratio, amplitude, time constant]. */
+  function modal(f, parts, amp, dest, t) {
+    parts.forEach(function (pp) {
+      var o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = f * pp[0];
+      g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(pp[1] * amp, t + 0.003); g.gain.exponentialRampToValueAtTime(0.0005, t + 0.003 + pp[2] * 3);
+      o.connect(g); g.connect(dest); o.start(t); o.stop(t + pp[2] * 3 + 0.05);
+    });
+  }
+  function sweepTone(dest, t, type, f0, f1, glide, amp, dur) {
+    var o = ac.createOscillator(), g = ac.createGain(); o.type = type;
+    o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + glide);
+    g.gain.setValueAtTime(amp, t); g.gain.exponentialRampToValueAtTime(0.0005, t + dur);
+    o.connect(g); g.connect(dest); o.start(t); o.stop(t + dur + 0.02); return o;
+  }
+  function circleHit(q, p, c, r) {                                         // fingertip moved from outside the circle into it, or right through it
+    if (dist(q, c) <= r) return false;
+    return dist(p, c) <= r || segDist(c, q, p).d <= r;
+  }
+  function burstAt(x, y, hue, n, sp) {
+    for (var i = 0; i < n; i++) { var a = Math.random() * 6.283, v = (0.3 + Math.random()) * sp * DIAG; particles.push({ x: x, y: y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0, max: 0.3 + Math.random() * 0.4, hue: hue, sat: 85 }); }
+  }
+
+  /* ---------- drum kit ---------- */
+  function layoutPads() {
+    var land = W >= H, m = Math.min(W, H), defs = land
+      ? [['hihat', 0.16, 0.4, 0.16], ['crash', 0.3, 0.17, 0.15], ['tom1', 0.5, 0.33, 0.14], ['ride', 0.72, 0.17, 0.15], ['snare', 0.27, 0.72, 0.17], ['tom2', 0.73, 0.7, 0.17], ['kick', 0.5, 0.86, 0.12]]
+      : [['hihat', 0.2, 0.3, 0.15], ['crash', 0.75, 0.2, 0.16], ['tom1', 0.55, 0.42, 0.13], ['snare', 0.25, 0.62, 0.17], ['ride', 0.82, 0.48, 0.13], ['tom2', 0.72, 0.7, 0.16], ['kick', 0.45, 0.86, 0.14]];
+    var old = {}; pads.forEach(function (p) { old[p.id] = p; });
+    pads = defs.map(function (d) { return { id: d[0], c: [lx(d[1] * W), d[2] * H], r: d[3] * m, t: old[d[0]] ? old[d[0]].t : 0 }; });
+  }
+  function playDrum(id, vel) {
+    var pd = pads.filter(function (p) { return p.id === id; })[0];
+    if (!ac || !pd) return;
+    var t = ac.currentTime, g = ac.createGain(); g.gain.value = 0.35 + 0.65 * vel; g.connect(mkPan(pd.c[0]));
+    if (id === 'kick') { sweepTone(g, t, 'sine', 155, 48, 0.13, 1.1, 0.5); noiseHit(g, t, 'highpass', 1800, 0.7, 0.25, 0.012); }
+    else if (id === 'snare') { noiseHit(g, t, 'bandpass', 1900, 0.6, 0.9, 0.24); noiseHit(g, t, 'highpass', 5000, 0.7, 0.3, 0.12); sweepTone(g, t, 'triangle', 195, 165, 0.08, 0.6, 0.14); }
+    else if (id === 'hihat') { noiseHit(g, t, 'highpass', 7500, 0.8, 0.55, 0.06); noiseHit(g, t, 'bandpass', 10000, 1, 0.3, 0.05); }
+    else if (id === 'crash') { noiseHit(g, t, 'highpass', 4200, 0.6, 0.65, 1.8); noiseHit(g, t, 'bandpass', 6500, 0.9, 0.35, 0.9); }
+    else if (id === 'ride') { noiseHit(g, t, 'highpass', 6000, 0.7, 0.3, 1.1); modal(510, [[1, 0.25, 0.4], [2.76, 0.15, 0.3], [5.4, 0.08, 0.2]], 1, g, t); }
+    else { var f0 = id === 'tom1' ? 200 : 120; sweepTone(g, t, 'sine', f0 * 1.4, f0, 0.15, 0.9, id === 'tom1' ? 0.5 : 0.75); noiseHit(g, t, 'lowpass', 1200, 0.7, 0.2, 0.04); }
+  }
+  function hitPad(pd, vel, now) {
+    pd.t = now; playDrum(pd.id, vel); stats.plays++; stats.drums = (stats.drums || 0) + 1;
+    burstAt(pd.c[0], pd.c[1], PAD_HUE[pd.id], Math.round(8 + 18 * vel), 0.35);
+  }
+  /* A strike, not a drift: fast enough per second, or a big enough jump between two frames (so slow devices still work). */
+  function strikeVel(h, q, p) {
+    var sp = dist(q, p) / (h.dt / 1000) / DIAG, jump = dist(q, p) / h.s;
+    if (sp < 0.35 && jump < 0.3) return 0;
+    return clamp(Math.max(sp / 1.6, jump / 1.2), 0.25, 1);
+  }
+  function interactDrums(now) {
+    hands.forEach(function (h) {
+      if (!h.prev) return;
+      [8, 12].forEach(function (ti) {
+        var q = h.prev[ti], p = h.pts[ti], vel = strikeVel(h, q, p);
+        if (!vel) return;
+        pads.forEach(function (pd) { if (circleHit(q, p, pd.c, pd.r) && now - pd.t > 80) hitPad(pd, vel, now); });
+      });
+    });
+  }
+
+  /* ---------- tabla ---------- */
+  function layoutTabla() {
+    var land = W >= H, m = Math.min(W, H);
+    var b = land ? [0.32, 0.6, 0.25] : [0.3, 0.68, 0.27], d = land ? [0.7, 0.6, 0.2] : [0.7, 0.45, 0.21];
+    var bc = [lx(b[0] * W), b[1] * H], dc = [lx(d[0] * W), d[1] * H], Rb = b[2] * m, Rd = d[2] * m, sr = 0.07 * m, gap = 0.06 * m, out = S.lefty ? -1 : 1;
+    // the small Te and Ke pads sit beside the drums, never above them, so a downward stroke onto a drum cannot clip one
+    var tdir = land ? [out, 0] : [out * 0.707, 0.707], kdir = land ? [-out, 0] : [-out * 0.5, -0.866];
+    function place(c, R, d) { return [clamp(c[0] + d[0] * (R + gap + sr), sr + 4, W - sr - 4), clamp(c[1] + d[1] * (R + gap + sr), sr + 4, H - sr - 4)]; }
+    var old = {}; tpads.forEach(function (p) { old[p.id] = p; });
+    tpads = [
+      { id: 'bayan', bol: 'Ge', c: bc, r: Rb }, { id: 'dayan', bol: 'Na', c: dc, r: Rd },
+      { id: 'ke', bol: 'Ke', c: place(bc, Rb, kdir), r: sr }, { id: 'te', bol: 'Te', c: place(dc, Rd, tdir), r: sr }
+    ].map(function (p) { p.t = old[p.id] ? old[p.id].t : 0; return p; });
+  }
+  /* The dayan is tuned to Sa (the Key setting). Its black syahi makes the overtones harmonic, which is why a
+     tabla sounds pitched: Na rings in the upper harmonics, Tin in the fundamental. The bayan rises as it sounds. */
+  function playTabla(bol, vel, x) {
+    if (!ac) return null;
+    var t = ac.currentTime, f = mtof(60 + S.key), fb = f / 3.2, g = ac.createGain(); g.gain.value = 0.55 + 0.45 * vel; g.connect(mkPan(x));
+    if (bol === 'Na') { modal(f, [[1, 0.3, 0.12], [2, 0.8, 0.22], [3, 0.5, 0.16], [4, 0.35, 0.12], [5, 0.2, 0.08]], 0.5, g, t); noiseHit(g, t, 'highpass', 2500, 0.7, 0.25, 0.03); }
+    else if (bol === 'Tin') modal(f, [[1, 0.9, 0.35], [2, 0.45, 0.25], [3, 0.2, 0.18], [4, 0.1, 0.1]], 0.5, g, t);
+    else if (bol === 'Te') { modal(f, [[1, 0.5, 0.025], [2.6, 0.25, 0.02]], 0.6, g, t); noiseHit(g, t, 'bandpass', 1600, 1.2, 0.35, 0.05); }
+    else if (bol === 'Ke') { noiseHit(g, t, 'lowpass', 380, 0.8, 0.8, 0.09); modal(fb * 1.1, [[1, 0.5, 0.025]], 0.8, g, t); }
+    else if (bol === 'Ge') {
+      var o = sweepTone(g, t, 'sine', fb, fb * 1.18, 0.22, 0.9, 1.6), o2 = sweepTone(g, t, 'sine', fb * 2, fb * 2.36, 0.22, 0.16, 1.2);
+      noiseHit(g, t, 'lowpass', 300, 0.7, 0.3, 0.04);
+      return { set: function (ratio) { var tt = ac.currentTime; [[o, 1.18], [o2, 2.36]].forEach(function (z) { z[0].frequency.cancelScheduledValues(tt); z[0].frequency.setTargetAtTime(fb * z[1] * ratio, tt, 0.04); }); } };
+    }
+    return null;
+  }
+  function hitTabla(pd, bol, vel, now, h) {
+    pd.t = now; pd.last = bol;
+    var shown = bol;
+    if ((bol === 'Na' && now - (lastBol.Ge || 0) < 90) || (bol === 'Ge' && now - (lastBol.Na || 0) < 90)) shown = 'Dha';     // Na + Ge together
+    if ((bol === 'Tin' && now - (lastBol.Ge || 0) < 90) || (bol === 'Ge' && now - (lastBol.Tin || 0) < 90)) shown = 'Dhin';
+    lastBol[bol] = now;
+    var v = playTabla(bol, vel, pd.c[0]);
+    if (v && h) geVoice = { set: v.set, hand: h.id, y0: h.pts[0][1], t0: now, lift: 0, last: 1 };
+    labels.push({ x: pd.c[0], y: pd.c[1] - pd.r * 0.25, text: shown, t0: now, hue: pd.id === 'bayan' || pd.id === 'ke' ? 30 : 50 });
+    burstAt(pd.c[0], pd.c[1], 40, Math.round(6 + 12 * vel), 0.25);
+    stats.plays++; stats.tabla = (stats.tabla || 0) + 1; stats.lastBol = shown;
+  }
+  function tablaBol(pd, p) { return pd.id === 'dayan' ? (dist(p, pd.c) < 0.5 * pd.r ? 'Tin' : 'Na') : pd.bol; }   // dayan: black centre rings (Tin), the rim is sharp (Na)
+  function interactTabla(now) {
+    hands.forEach(function (h) {
+      if (!h.prev) return;
+      [8, 12].forEach(function (ti) {
+        var q = h.prev[ti], p = h.pts[ti], vel = strikeVel(h, q, p);
+        if (!vel) return;
+        var hit = null;                                                    // one stroke sounds one bol: the pad where the fingertip lands
+        tpads.forEach(function (pd) { if (circleHit(q, p, pd.c, pd.r) && now - pd.t > 80 && (!hit || dist(p, pd.c) / pd.r < dist(p, hit.c) / hit.r)) hit = pd; });
+        if (hit) hitTabla(hit, tablaBol(hit, p), vel, now, hit.id === 'bayan' ? h : null);
+      });
+    });
+    if (geVoice) {                                                         // meend: lift the hand that struck the bayan to bend its pitch upward
+      var gh = hands.filter(function (h) { return h.id === geVoice.hand; })[0];
+      if (gh) { geVoice.lift = clamp((geVoice.y0 - gh.pts[0][1]) / (0.25 * H), 0, 1); var r = 1 + 0.5 * geVoice.lift; if (geVoice.lift > 0.05 && Math.abs(r - geVoice.last) > 0.01) { geVoice.set(r); geVoice.last = r; } }
+      if (now - geVoice.t0 > 1500) geVoice = null;
+    }
+  }
+
+  /* ---------- theremin ---------- */
+  function therRoot() { return 48 + S.key; }                               // the key's root in octave 3, two octaves of range
+  function therMap(y) { var u = clamp((0.92 * H - y) / (0.84 * H), 0, 1), m = therRoot() + 24 * u; return S.snap ? snap(m, therRoot()) : m; }
+  function therVoice() {
+    if (ther || !ac) return ther;
+    var t = ac.currentTime, o = ac.createOscillator(), o2 = ac.createOscillator(), g2 = ac.createGain(), sh = ac.createWaveShaper(), lp2 = ac.createBiquadFilter(), g = ac.createGain(), lfo = ac.createOscillator(), lg = ac.createGain();
+    o.type = 'sine'; o2.type = 'triangle'; o.frequency.value = 220; o2.frequency.value = 440; g2.gain.value = 0.1;
+    sh.curve = driveCurve(1.4); lp2.type = 'lowpass'; lp2.frequency.value = 3500;
+    lfo.frequency.value = 5.6; lg.gain.value = 14; lfo.connect(lg); lg.connect(o.detune); lg.connect(o2.detune);   // vibrato
+    g.gain.value = 0;
+    o.connect(sh); o2.connect(g2); g2.connect(sh); sh.connect(lp2); lp2.connect(g); g.connect(master);
+    o.start(t); o2.start(t); lfo.start(t);
+    return (ther = { o: o, o2: o2, g: g, lfo: lfo, on: false });
+  }
+  function therSet(m, vol) {
+    var v = therVoice(); stats.ther = mtof(m); if (!v) return;
+    var t = ac.currentTime, f = mtof(m), tc = S.snap ? 0.03 : 0.012;
+    if (!v.on) { v.o.frequency.setValueAtTime(f, t); v.o2.frequency.setValueAtTime(2 * f, t); }
+    else { v.o.frequency.setTargetAtTime(f, t, tc); v.o2.frequency.setTargetAtTime(2 * f, t, tc); }
+    v.g.gain.setTargetAtTime(0.32 * vol * vol, t, 0.04); v.on = true;
+  }
+  function therOff() { if (ther && ther.on) { ther.g.gain.setTargetAtTime(0, ac.currentTime, 0.08); ther.on = false; } }
+  function therKill() {
+    if (!ther) return; var t = ac.currentTime;
+    ther.g.gain.setTargetAtTime(0, t, 0.05); [ther.o, ther.o2, ther.lfo].forEach(function (o) { try { o.stop(t + 0.4); } catch (e) {} }); ther = null;
+  }
+  function interactTheremin(now) {
+    var ph = null, vh = null;
+    hands.forEach(function (h) { var pitchSide = S.lefty ? h.c[0] < W / 2 : h.c[0] >= W / 2; if (pitchSide) { if (!ph) ph = h; } else if (!vh) vh = h; });
+    if (!ph && vh && hands.length === 1) { ph = vh; vh = null; }           // one hand: it sets the pitch, volume stays medium
+    if (!ph) { if (!Object.keys(pointers).length) { therOff(); therState.tip = null; } return; }
+    var tip = ph.pts[8], m = therMap(tip[1]), vol = vh ? clamp((0.92 * H - vh.pts[8][1]) / (0.8 * H), 0, 1) : 0.7;
+    therState.tip = tip; therState.m = m; therState.vol = vol; therState.vtip = vh ? vh.pts[8] : null;
+    therTrail.push({ x: tip[0], y: tip[1], t: now }); if (therTrail.length > 40) therTrail.shift();
+    therSet(m, vol);
+  }
+
+  /* ---------- drawing the new instruments ---------- */
+  function keyLabel(m) { var pc = ((m % 12) + 12) % 12; return S.names === 'sargam' ? SARGAM[(pc - S.key + 12) % 12] : WEST[pc] + (pc === 0 ? Math.floor(m / 12) - 1 : ''); }
+  function drawKeys(now, k) {
+    var whites = keys.filter(function (x) { return !x.black; }), blacks = keys.filter(function (x) { return x.black; });
+    whites.forEach(function (key) {
+      var f = Math.max(0, 1 - (now - key.t) / 400);
+      ctx.fillStyle = key.on ? 'rgba(61,220,151,.78)' : 'rgba(255,255,255,' + (0.22 + 0.3 * f) + ')'; rrect(key.x, key.y, key.w, key.h, 6 * k); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1 * k; rrect(key.x, key.y, key.w, key.h, 6 * k); ctx.stroke();
+      ctx.font = '600 ' + Math.min(13 * k, key.w * 0.36) + 'px system-ui,sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = key.on ? '#04261a' : 'rgba(255,255,255,.85)';
+      ctx.fillText(keyLabel(key.midi), key.x + key.w / 2, key.y + key.h - 10 * k);
+    });
+    blacks.forEach(function (key) {
+      ctx.fillStyle = key.on ? 'rgba(61,220,151,.95)' : 'rgba(12,14,20,.86)'; rrect(key.x, key.y, key.w, key.h, 5 * k); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 1 * k; rrect(key.x, key.y, key.w, key.h, 5 * k); ctx.stroke();
+    });
+    ctx.strokeStyle = 'rgba(61,220,151,.9)'; ctx.lineWidth = 2.5 * k; ctx.beginPath(); ctx.moveTo(0, keySurf); ctx.lineTo(W, keySurf); ctx.stroke();
+    ctx.strokeStyle = 'rgba(61,220,151,.25)'; ctx.lineWidth = 9 * k; ctx.beginPath(); ctx.moveTo(0, keySurf); ctx.lineTo(W, keySurf); ctx.stroke();
+  }
+  function disc(c, r) { ctx.beginPath(); ctx.arc(c[0], c[1], r, 0, 6.283); }
+  function drawPads(now, k) {
+    pads.forEach(function (pd) {
+      var f = Math.max(0, 1 - (now - pd.t) / 300), hue = PAD_HUE[pd.id], cym = pd.id === 'hihat' || pd.id === 'crash' || pd.id === 'ride';
+      var gr = ctx.createRadialGradient(pd.c[0], pd.c[1], pd.r * 0.1, pd.c[0], pd.c[1], pd.r);
+      gr.addColorStop(0, 'hsla(' + hue + ',' + (cym ? 80 : 30) + '%,' + (cym ? 70 : 85) + '%,' + (0.25 + 0.5 * f) + ')');
+      gr.addColorStop(1, 'hsla(' + hue + ',' + (cym ? 75 : 40) + '%,' + (cym ? 45 : 55) + '%,' + (0.2 + 0.35 * f) + ')');
+      ctx.fillStyle = gr; disc(pd.c, pd.r); ctx.fill();
+      ctx.strokeStyle = 'hsla(' + hue + ',70%,75%,' + (0.6 + 0.4 * f) + ')'; ctx.lineWidth = 2.5 * k; disc(pd.c, pd.r); ctx.stroke();
+      if (cym) { ctx.strokeStyle = 'hsla(' + hue + ',60%,80%,.35)'; ctx.lineWidth = 1 * k; [0.35, 0.6, 0.82].forEach(function (s) { disc(pd.c, pd.r * s); ctx.stroke(); }); }
+      if (f > 0) { ctx.strokeStyle = 'hsla(' + hue + ',90%,80%,' + f + ')'; ctx.lineWidth = 3 * k; disc(pd.c, pd.r * (1 + 0.35 * (1 - f))); ctx.stroke(); }
+      ctx.font = '700 ' + 15 * k + 'px system-ui,sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = 'rgba(255,255,255,.92)';
+      ctx.fillText(PAD_NAMES[pd.id], pd.c[0], pd.c[1]); ctx.textBaseline = 'alphabetic';
+    });
+  }
+  function drawTabla(now, k) {
+    tpads.forEach(function (pd) {
+      var f = Math.max(0, 1 - (now - pd.t) / 300), big = pd.id === 'bayan' || pd.id === 'dayan';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if (big) {
+        ctx.fillStyle = pd.id === 'bayan' ? 'rgba(160,130,95,.6)' : 'rgba(120,75,40,.65)'; disc(pd.c, pd.r * 1.07); ctx.fill();
+        ctx.fillStyle = 'rgba(236,220,186,' + (0.55 + 0.3 * f) + ')'; disc(pd.c, pd.r); ctx.fill();
+        var sc = pd.id === 'bayan' ? [pd.c[0] + (S.lefty ? 1 : -1) * 0.22 * pd.r, pd.c[1]] : pd.c, srr = pd.id === 'bayan' ? 0.38 * pd.r : 0.5 * pd.r;
+        ctx.fillStyle = 'rgba(28,24,26,.9)'; disc(sc, srr); ctx.fill();
+        ctx.font = '700 ' + 16 * k + 'px system-ui,sans-serif';
+        if (pd.id === 'dayan') { ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.fillText('Tin', pd.c[0], pd.c[1]); ctx.fillStyle = 'rgba(60,40,25,.9)'; ctx.fillText('Na', pd.c[0], pd.c[1] - 0.75 * pd.r); }
+        else { ctx.fillStyle = 'rgba(60,40,25,.9)'; ctx.fillText('Ge', pd.c[0] + (S.lefty ? -1 : 1) * 0.45 * pd.r, pd.c[1]); }
+      } else {
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.15 + 0.45 * f) + ')'; disc(pd.c, pd.r); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.5 * k; disc(pd.c, pd.r); ctx.stroke();
+        ctx.font = '700 ' + 15 * k + 'px system-ui,sans-serif'; ctx.fillStyle = '#fff'; ctx.fillText(pd.bol, pd.c[0], pd.c[1]);
+      }
+      if (f > 0) { ctx.strokeStyle = 'rgba(255,220,150,' + f + ')'; ctx.lineWidth = 3 * k; disc(pd.c, pd.r * (1 + 0.25 * (1 - f))); ctx.stroke(); }
+      ctx.textBaseline = 'alphabetic';
+    });
+    if (geVoice && geVoice.lift > 0.05) {
+      var b = tpads[0]; ctx.strokeStyle = 'rgba(255,200,120,.95)'; ctx.lineWidth = 4 * k;
+      ctx.beginPath(); ctx.arc(b.c[0], b.c[1], b.r * 1.15, -Math.PI / 2, -Math.PI / 2 + geVoice.lift * Math.PI); ctx.stroke();
+      ctx.font = '600 ' + 13 * k + 'px system-ui,sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(255,220,160,.95)'; ctx.fillText('meend', b.c[0], b.c[1] + b.r * 1.3);
+    }
+  }
+  function drawTheremin(now, k) {
+    var rx = lx(0.94 * W), mx = lx(0.06 * W), top = 0.08 * H, bot = 0.92 * H, root = therRoot(), steps = SCALES[S.scale].steps;
+    function yOf(m) { return bot - (m - root) / 24 * (bot - top); }
+    ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3 * k; ctx.beginPath(); ctx.moveTo(rx, top); ctx.lineTo(rx, bot); ctx.stroke();
+    ctx.font = '600 ' + 11 * k + 'px system-ui,sans-serif'; ctx.textAlign = S.lefty ? 'left' : 'right'; ctx.textBaseline = 'middle';
+    for (var m = root; m <= root + 24; m++) {
+      var inScale = steps.indexOf((m - root) % 12) >= 0, isRoot = (m - root) % 12 === 0;
+      if (S.snap && !inScale) continue;
+      var y = yOf(m), len = (isRoot ? 16 : inScale ? 10 : 5) * k, dir = S.lefty ? 1 : -1;
+      ctx.strokeStyle = isRoot ? 'rgba(61,220,151,.9)' : 'rgba(255,255,255,.55)'; ctx.lineWidth = (isRoot ? 2.5 : 1.5) * k;
+      ctx.beginPath(); ctx.moveTo(rx, y); ctx.lineTo(rx + dir * len, y); ctx.stroke();
+      if (inScale) { ctx.fillStyle = isRoot ? 'rgba(61,220,151,.95)' : 'rgba(255,255,255,.7)'; ctx.fillText(noteName(m), rx + dir * (len + 4 * k), y); }
+    }
+    ctx.textBaseline = 'alphabetic';
+    var vol = therState.tip ? therState.vol : 0;                           // volume meter
+    ctx.fillStyle = 'rgba(255,255,255,.12)'; rrect(mx - 7 * k, top, 14 * k, bot - top, 7 * k); ctx.fill();
+    ctx.fillStyle = 'rgba(61,220,151,.85)'; rrect(mx - 7 * k, bot - vol * (bot - top), 14 * k, vol * (bot - top), 7 * k); ctx.fill();
+    ctx.font = '600 ' + 12 * k + 'px system-ui,sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(255,255,255,.7)'; ctx.fillText('volume', mx, top - 10 * k);
+    if (!therState.tip) return;
+    var tip = therState.tip, hue = hueOf(therState.m), ty = yOf(therState.m);
+    ctx.globalCompositeOperation = 'lighter';
+    for (var i = 1; i < therTrail.length; i++) {
+      var a = therTrail[i - 1], b = therTrail[i], al = Math.max(0, 1 - (now - b.t) / 900);
+      ctx.strokeStyle = 'hsla(' + hue + ',90%,65%,' + al * 0.8 + ')'; ctx.lineWidth = 6 * k * al; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    var wob = 3 * k * Math.sin(now / 28);
+    ctx.strokeStyle = 'hsla(' + hue + ',90%,70%,.35)'; ctx.lineWidth = 10 * k; ctx.beginPath(); ctx.moveTo(tip[0], tip[1]); ctx.quadraticCurveTo((tip[0] + rx) / 2, (tip[1] + ty) / 2 + wob, rx, ty); ctx.stroke();
+    ctx.strokeStyle = 'hsla(' + hue + ',90%,85%,.95)'; ctx.lineWidth = 2 * k; ctx.beginPath(); ctx.moveTo(tip[0], tip[1]); ctx.quadraticCurveTo((tip[0] + rx) / 2, (tip[1] + ty) / 2 + wob, rx, ty); ctx.stroke();
+    ctx.fillStyle = 'hsla(' + hue + ',90%,80%,1)'; disc([rx, ty], 7 * k); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.font = '800 ' + 24 * k + 'px system-ui,sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = 'hsl(' + hue + ',90%,82%)';
+    ctx.fillText(noteName(therState.m), tip[0], tip[1] - 26 * k);
+  }
+
+  /* ---------- touch for the new instruments ---------- */
+  function pointerDownInst(id, p, now) {
+    var q = pointers[id];
+    if (S.mode === 'keys') { var kk = keyAt(p); if (kk) q.kd = { key: kk, vel: 0.7, v: keyNoteOn(kk, 0.7) }; }
+    else if (S.mode === 'drums') { var pd = nearestIn(pads, p); if (pd) hitPad(pd, 0.75, now); }
+    else if (S.mode === 'tabla') { var tp = nearestIn(tpads, p); if (tp) hitTabla(tp, tablaBol(tp, p), 0.75, now, null); }
+    else if (S.mode === 'theremin') { q.ther = true; therPointer(p); }
+  }
+  function pointerMoveInst(q, p) {
+    if (S.mode === 'keys' && q.kd) { var kk = keyAt(p); if (kk && kk !== q.kd.key) { keyNoteOff(q.kd.key, q.kd.v); q.kd.key = kk; q.kd.v = keyNoteOn(kk, q.kd.vel); } }
+    else if (S.mode === 'theremin' && q.ther) therPointer(p);
+  }
+  function pointerUpInst(q) {
+    if (q.kd) { keyNoteOff(q.kd.key, q.kd.v); q.kd = null; }
+    if (q.ther && !seenHands().length) { therOff(); therState.tip = null; }
+  }
+  function therPointer(p) { var m = therMap(p[1]); therState.tip = p; therState.m = m; therState.vol = 0.7; therTrail.push({ x: p[0], y: p[1], t: performance.now() }); if (therTrail.length > 40) therTrail.shift(); therSet(m, 0.7); }
+  function nearestIn(list, p) { var best = null; list.forEach(function (pd) { var d = dist(p, pd.c); if (d <= pd.r && (!best || d / pd.r < best.d)) best = { pd: pd, d: d / pd.r }; }); return best && best.pd; }
 
   /* ================= touch and mouse ================= */
   function toCanvas(e) {
@@ -378,16 +776,18 @@
   canvas.addEventListener('pointerdown', function (e) {
     initAudio(); try { canvas.setPointerCapture(e.pointerId); } catch (er) {}
     var p = toCanvas(e), now = performance.now(); pointers[e.pointerId] = { p: p, t: now };
+    pointerDownInst(e.pointerId, p, now);
     if (S.mode === 'strum') zones.forEach(function (z, i) { if (p[0] >= z.x && p[0] <= z.x + z.w && p[1] >= z.y && p[1] <= z.y + z.h) { chordIdx = i; tuneStrum(); } });
     pointerLive(now);
   });
   canvas.addEventListener('pointermove', function (e) {
     var q = pointers[e.pointerId]; if (!q) return;
     var p = toCanvas(e), now = performance.now();
-    if (!plive) sweep(q.p, p, Math.max(8, now - q.t), now);
+    if (S.mode === 'strings' || S.mode === 'strum') { if (!plive) sweep(q.p, p, Math.max(8, now - q.t), now); }
+    else pointerMoveInst(q, p);
     q.p = p; q.t = now; pointerLive(now);
   });
-  function endPointer(e) { if (!pointers[e.pointerId]) return; delete pointers[e.pointerId]; pointerLive(performance.now()); }
+  function endPointer(e) { var q = pointers[e.pointerId]; if (!q) return; delete pointers[e.pointerId]; pointerUpInst(q); pointerLive(performance.now()); }
   canvas.addEventListener('pointerup', endPointer); canvas.addEventListener('pointercancel', endPointer);
   function pointerLive(now) {
     var ids = Object.keys(pointers);
@@ -471,7 +871,7 @@
       ctx.strokeStyle = h.pinch ? '#fff' : 'rgba(255,255,255,.55)'; ctx.lineWidth = 2 * k;
       ctx.beginPath(); ctx.arc(h.pp[0], h.pp[1], (h.pinch ? 7 : 5) * k, 0, 6.283); ctx.stroke();
       if (h.pinch) { ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.beginPath(); ctx.arc(h.pp[0], h.pp[1], 3 * k, 0, 6.283); ctx.fill(); }
-      [8, 12].forEach(function (i) { if (h.pinch && i === 8) return; ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.beginPath(); ctx.arc(h.pts[i][0], h.pts[i][1], 4.5 * k, 0, 6.283); ctx.fill(); });
+      (S.mode === 'keys' ? TIPS : [8, 12]).forEach(function (i) { if (h.pinch && i === 8 && (S.mode === 'strings' || S.mode === 'strum')) return; if (S.mode === 'keys' && h.kd && h.kd[i]) { ctx.fillStyle = '#3ddc97'; ctx.beginPath(); ctx.arc(h.pts[i][0], h.pts[i][1], 8 * k, 0, 6.283); ctx.fill(); } ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.beginPath(); ctx.arc(h.pts[i][0], h.pts[i][1], 4.5 * k, 0, 6.283); ctx.fill(); });
     });
   }
   function drawStrum(now, k) {
@@ -501,7 +901,12 @@
     } else { ctx.fillStyle = '#07090d'; ctx.fillRect(0, 0, W, H); }
     ctx.globalCompositeOperation = 'lighter';
     if (S.mode === 'strum') { ctx.globalCompositeOperation = 'source-over'; drawStrum(now, k); ctx.globalCompositeOperation = 'lighter'; }
-    else strings.forEach(function (s) { drawString(s, now, k); });
+    else if (S.mode === 'strings') strings.forEach(function (s) { drawString(s, now, k); });
+    else {
+      ctx.globalCompositeOperation = 'source-over';
+      if (S.mode === 'keys') drawKeys(now, k); else if (S.mode === 'drums') drawPads(now, k); else if (S.mode === 'tabla') drawTabla(now, k); else drawTheremin(now, k);
+      ctx.globalCompositeOperation = 'lighter';
+    }
     for (var i = particles.length - 1; i >= 0; i--) {
       var p = particles[i]; p.life += dt; if (p.life > p.max) { particles.splice(i, 1); continue; }
       p.vx *= 0.92; p.vy = p.vy * 0.92 + 0.15 * DIAG * dt; p.x += p.vx * dt; p.y += p.vy * dt;
@@ -531,6 +936,11 @@
   function seenHands() { return hands.filter(function (h) { return h.hits >= 2; }); }
   function pill() { var n = seenHands().length; $('pill').textContent = !ready ? 'loading…' : (running ? (fps < 10 ? fps.toFixed(1) : fps.toFixed(0)) + ' fps · ' + n + (n === 1 ? ' hand' : ' hands') : 'ready'); }
   function hint() {
+    var any = seenHands().length;
+    if (S.mode === 'keys') return any ? 'Tap a fingertip down across the green line to play. Lift it to release.' : 'Hold your hands up so the fingertips are above the green line.';
+    if (S.mode === 'drums') return any ? 'Strike the pads with quick fingertip movements.' : 'Show your hands to the camera, then strike the pads.';
+    if (S.mode === 'tabla') return any ? 'Dayan: rim for Na, black centre for Tin. Bayan for Ge, then lift to bend it.' : 'Show both hands to the camera.';
+    if (S.mode === 'theremin') return any ? 'Raise the ' + (S.lefty ? 'left' : 'right') + '-side hand for higher notes; the other hand sets the volume.' : 'Show your hands to the camera.';
     if (S.mode === 'strum') return hands.length ? 'Point at a chord with one hand. Sweep the other hand’s fingers across the strings.' : 'Show both hands to the camera.';
     if (!seenHands().length) return 'Show your hands to the camera, palms facing it, in good light.';
     if (live) return 'Pull apart to stretch, open your fingers to place the string.';
@@ -554,6 +964,7 @@
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function stopCamera() {
+    releaseAll(); therState.tip = null;
     running = false; gen++;
     if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
     if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
@@ -600,13 +1011,26 @@
 
   /* ================= controls ================= */
   function setMode(m) {
+    releaseAll(); therState.tip = null;
     S.mode = m; saveS(); live = null; plive = null; holdDel = null;
     document.querySelectorAll('#modeSeg button').forEach(function (b) { b.classList.toggle('on', b.dataset.mode === m); });
-    $('undoBtn').disabled = $('clearBtn').disabled = m === 'strum';
+    $('undoBtn').style.display = $('clearBtn').style.display = m === 'strings' ? '' : 'none';
+    document.querySelectorAll('[data-modes]').forEach(function (el) { el.style.display = el.dataset.modes.split(' ').indexOf(m) >= 0 ? '' : 'none'; });
+    prewarm();
     renderHelp(); status(running ? hint() : (ready ? 'Ready. Press Start, or play by touch.' : 'Loading hand tracking…'));
   }
   function renderHelp() {
-    var h = $('help');
+    var h = $('help'), side = S.lefty ? 'left' : 'right', other = S.lefty ? 'right' : 'left';
+    var HELP = {
+      keys: '<p><b>Play:</b> hold your hands above the keyboard and tap a fingertip down so it crosses the green line. Each finger plays its own key, so chords work, and a faster tap plays louder. Lift the finger above the line to let go.</p>' +
+        '<p><b>Harmonium</b> holds the note while your finger stays down, and sliding along the keys moves between notes. <b>Piano</b> rings like a real one; turn on Sustain pedal to let notes ring after you lift. On a touch screen, press the keys directly.</p>',
+      drums: '<p><b>Play:</b> strike a pad with a quick flick of a fingertip, as if holding sticks. A faster strike plays louder. Each pad needs a fresh strike from outside it.</p><p>On a touch screen, tap the pads.</p>',
+      tabla: '<p><b>Dayan</b> (' + side + '): strike the rim for <b>Na</b>, the black centre for <b>Tin</b>, and the small pad beside it for <b>Te</b>. <b>Bayan</b> (' + other + '): strike it for <b>Ge</b>, the small pad for <b>Ke</b>. Na or Tin with Ge at the same moment sound <b>Dha</b> or <b>Dhin</b>.</p>' +
+        '<p><b>Meend:</b> after a Ge, lift that hand to bend the bayan’s pitch upward. The dayan is tuned to Sa, set by Key. Left-handed swaps the drums.</p>',
+      theremin: '<p><b>Pitch:</b> your ' + side + '-side hand sets the note. Raise its index finger for higher notes, along the scale drawn on the ' + side + '. <b>Volume:</b> raise your other hand for louder. With one hand only, the volume stays medium.</p>' +
+        '<p>With Snap to scale on, the pitch glides from note to note of the chosen scale or raag. Turn it off for a fully continuous, singing pitch. On a touch screen, drag up and down.</p>'
+    };
+    if (HELP[S.mode]) { h.innerHTML = HELP[S.mode]; return; }
     h.innerHTML = S.mode === 'strings'
       ? '<p><b>Make a string:</b> pinch thumb and index finger on both hands, then pull your hands apart. A ruler shows the note. Open your fingers to leave the string in the air.</p>' +
         '<p><b>Play:</b> sweep a fingertip through a string. A faster sweep plays louder, and plucking near the end sounds brighter. Shorter strings play higher notes, as on a real string.</p>' +
@@ -617,10 +1041,11 @@
   function fillSelects() {
     var sc = $('scale'); Object.keys(SCALES).forEach(function (k) { var o = document.createElement('option'); o.value = k; o.textContent = SCALES[k].name; sc.appendChild(o); });
     var ky = $('key'); WEST.forEach(function (n, i) { var o = document.createElement('option'); o.value = i; o.textContent = n + ' (' + SARGAM[0] + ' = ' + n + ')'; ky.appendChild(o); });
-    [['tone', 'tone'], ['scale', 'scale'], ['key', 'key'], ['names', 'names'], ['chords', 'chords'], ['quality', 'quality']].forEach(function (p) {
+    [['tone', 'tone'], ['scale', 'scale'], ['key', 'key'], ['names', 'names'], ['chords', 'chords'], ['quality', 'quality'], ['keysel', 'keys'], ['octave', 'octave']].forEach(function (p) {
       var el = $(p[0]); el.value = String(S[p[1]]);
       el.addEventListener('change', function () {
-        S[p[1]] = p[1] === 'key' ? parseInt(el.value, 10) : el.value; saveS();
+        S[p[1]] = p[1] === 'key' || p[1] === 'octave' ? parseInt(el.value, 10) : el.value; saveS();
+        if (p[1] === 'keys' || p[1] === 'octave') { releaseAll(); layoutKeys(); prewarm(); }
         if (p[1] === 'tone') { bufCache = {}; cacheKeys = []; applyTone(); }
         if (p[1] === 'scale' || p[1] === 'key') retune();
         if (p[1] === 'chords') { chordIdx = 0; layoutStrum(); }
@@ -639,7 +1064,7 @@
   document.querySelectorAll('[data-set]').forEach(function (el) {
     el.checked = !!S[el.dataset.set];
     el.addEventListener('change', function () { S[el.dataset.set] = el.checked; saveS();
-      if (el.dataset.set === 'reverb') applyTone(); if (el.dataset.set === 'snap') retune(); if (el.dataset.set === 'lefty') { layoutStrum(); renderHelp(); } });
+      if (el.dataset.set === 'reverb') applyTone(); if (el.dataset.set === 'snap') retune(); if (el.dataset.set === 'lefty') { layoutAll(); renderHelp(); } });
   });
   document.querySelectorAll('#modeSeg button').forEach(function (b) { b.addEventListener('click', function () { initAudio(); setMode(b.dataset.mode); }); });
   $('startBtn').addEventListener('click', startCamera);
@@ -650,7 +1075,8 @@
   document.addEventListener('visibilitychange', async function () { if (!document.hidden && running && !wakeLock) { try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {} } });
 
   /* ================= boot ================= */
-  fillSelects(); layoutStrum(); setMode(S.mode); requestAnimationFrame(render);
+  if (['strings', 'strum', 'keys', 'drums', 'tabla', 'theremin'].indexOf(S.mode) < 0) S.mode = 'strings';
+  fillSelects(); layoutAll(); setMode(S.mode); requestAnimationFrame(render);
   (async function () {
     try { await initEngine(); status('Ready. Press Start, or play by touch.'); }
     catch (e) { status('Hand tracking could not load: ' + (e && e.message ? e.message : e) + '. You can still play by touch.', 'bad'); }
@@ -660,7 +1086,7 @@
   window.AirGuitar = {   // for testing
     feed: function (dets, t) { processHands(dets, t || performance.now()); }, hold: function (v) { testHold = v; }, setSize: setSize,
     get hands() { return hands; }, get strings() { return strings; }, get strum() { return strum; }, get live() { return live; },
-    get chord() { return CHORD_SETS[S.chords][chordIdx]; }, stats: stats, S: S, get human() { return human; }, get engine() { return engine; },
+    get chord() { return CHORD_SETS[S.chords][chordIdx]; }, get keys() { return keys; }, get keySurf() { return keySurf; }, get pads() { return pads; }, get tpads() { return tpads; }, get geVoice() { return geVoice; }, get ther() { return therState; }, setMode: setMode, stats: stats, S: S, get human() { return human; }, get engine() { return engine; },
     lengthToMidi: lengthToMidi, initAudio: initAudio, ksBuffer: function (f, u, v) { initAudio(); return ksBuffer(f, u, v); }, get ac() { return ac; }
   };
 })();

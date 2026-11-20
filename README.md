@@ -20,7 +20,16 @@ Two engine instances share the work. A light detector runs on every frame and fe
 - Session log with time in view, CSV export, snapshot to PNG, optional spoken greetings
 - Encrypted backup and restore, installable on a phone, works offline after the first load
 
-## Air Guitar
+## Air Instruments
+
+`air-guitar.html` (the "Air instruments" button in the app). Besides the strings and guitar below:
+
+- **Keys:** a keyboard along the bottom; each fingertip that crosses the green line plays its own key, so chords work, louder for a faster tap. Piano (additive synthesis with string stiffness and paired strings, optional sustain pedal) or harmonium (sustained reeds, slide along the keys).
+- **Drums:** hi-hat, crash, ride, toms, snare and kick pads struck with quick fingertip flicks.
+- **Tabla:** dayan tuned to Sa (Na on the rim, Tin in the centre, Te beside it) and bayan (Ge, Ke); Na or Tin with Ge give Dha or Dhin, and lifting the hand after a Ge bends the bayan's pitch (meend).
+- **Theremin:** one hand sets the pitch, the other the volume; glides along a chosen scale or raag, or fully continuous.
+
+### Air Guitar
 
 `air-guitar.html` (the "Air guitar" button in the app) turns the camera into an instrument.
 

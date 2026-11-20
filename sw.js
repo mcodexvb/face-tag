@@ -1,5 +1,5 @@
 /* Offline cache for Face Tag. Models and the engine are cached after first use. */
-var VERSION = 'facetag-v7';
+var VERSION = 'facetag-v8';
 var CORE = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'lib/human.js', 'air-guitar.html', 'guitar.js'];
 
 self.addEventListener('install', function (e) {
