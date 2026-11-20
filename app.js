@@ -32,7 +32,28 @@
   var qCan = document.createElement('canvas'); qCan.width = qCan.height = 48; var qCtx = qCan.getContext('2d', { willReadFrequently: true });
   var pix = document.createElement('canvas'); pix.width = pix.height = 10; var pixCtx = pix.getContext('2d');
   var frameCan = document.createElement('canvas'), frameCtx = frameCan.getContext('2d'), fxMsg = '';
-  function fxOn() { return S.effect && S.effect !== 'none' && window.FaceFX; }
+  function fxOn() { return S.effect && S.effect !== 'none' && (window.FaceFX || window.FaceFX2); }
+  function fx2On() { return window.FaceFX2 && window.FaceFX2.has(S.effect); }
+  /* Person segmentation for background effects: a small separate engine, run on a 256-pixel copy of the picture. */
+  var humanS = null, segBusy = false, segCan = document.createElement('canvas'), segCtx = segCan.getContext('2d');
+  async function segment(pic) {
+    if (segBusy || !pic || !pic.width || !window.FaceFX2) return; segBusy = true;
+    try {
+      if (!humanS) {
+        var Hm = window.Human.Human || window.Human;
+        humanS = new Hm({ modelBasePath: MODELS, backend: humanA.tf.getBackend(), debug: false, cacheSensitivity: 0, filter: { enabled: true, equalization: false },
+          face: { enabled: false }, body: { enabled: false }, hand: { enabled: false }, object: { enabled: false }, gesture: { enabled: false },
+          segmentation: { enabled: true, modelPath: 'selfie.json', mode: 'alpha' } });
+        await humanS.load();
+      }
+      var w = 256, h = Math.max(64, Math.round(256 * pic.height / pic.width));
+      if (segCan.width !== w || segCan.height !== h) { segCan.width = w; segCan.height = h; }
+      segCtx.drawImage(pic, 0, 0, w, h);
+      var t = await humanS.segmentation(segCan);
+      if (t) { var d = await t.data(); humanS.tf.dispose(t); window.FaceFX2.setMask(d, w, h); }
+    } catch (e) { console.warn('segmentation failed', e); }
+    segBusy = false;
+  }
   var humanA = null, humanB = null, ready = false;
   var running = false, loopGen = 0, facing = 'user', stream = null, wakeLock = null, torchOn = false;
   var mode = 'camera';                 // 'camera' | 'photo'
@@ -453,7 +474,9 @@
       var faces = list.filter(function (t) { return t.mesh && t.mesh.length >= 468; }).map(function (t) {
         return { id: t.id, emotion: t.emotion, mesh: mirror ? t.mesh.map(function (p) { return [W - p[0], p[1]]; }) : t.mesh };
       });
-      try { fxMsg = window.FaceFX.draw(ctx, pic, W, H, faces, S.effect, performance.now()) || ''; } catch (e) { fxMsg = ''; }
+      if (fx2On()) { faces = list.filter(function (t) { return t.mesh && t.mesh.length >= 468; }).map(function (t) { return { id: t.id, mesh: mirror ? t.mesh.map(function (p) { return [W - p[0], p[1], p[2]]; }) : t.mesh }; }); }
+      try { fxMsg = (fx2On() ? window.FaceFX2.render(ctx, pic, W, H, faces, S.effect, performance.now()) : window.FaceFX.draw(ctx, pic, W, H, faces, S.effect, performance.now())) || ''; }
+      catch (e) { console.warn(e); fxMsg = ''; }
       if (!S.showLabels) return;
     } else if (!S.showLabels) return;
     list.forEach(function (t) { t.dx = mirror ? W - t.box.x - t.box.w : t.box.x; placed.push({ x: t.dx, y: t.box.y, w: t.box.w, h: t.box.h }); });
@@ -527,6 +550,8 @@
           if (!running || gen !== loopGen) return;
           if (performance.now() - t0 > 70) break;
         }
+        if (fx2On() && window.FaceFX2.needsSeg(S.effect) && frameCan.width) await segment(frameCan);   // the mask from the last frame is close enough
+        if (!running || gen !== loopGen) return;
         resolveIdentities(tracks, false); afterResolve(now, dtMs); render(); pill();
         if (tracks.length) lastFaceAt = now; idle = now - lastFaceAt > 6000;
         if (!enrol) status(fxMsg && fxOn() ? fxMsg : hint());
@@ -543,7 +568,7 @@
   async function startCamera() {
     if (!ready) { status('Face models are still loading, one moment…', 'warn'); return; }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { status('No camera access here. Open this page from an https:// address.', 'bad'); return; }
-    stopCamera(); cancelEnrol(); mode = 'camera'; photoCanvas = null; $('strip').classList.remove('on');
+    stopCamera(); cancelEnrol(); mode = 'camera'; photoCanvas = null; $('strip').classList.remove('on'); if (window.FaceFX2) window.FaceFX2.clearMask();
     var h = parseInt(S.res, 10) || 720;
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: facing, width: { ideal: Math.round(h * 16 / 9) }, height: { ideal: h } } }); }
     catch (e) { status('Camera could not start: ' + (e && e.name === 'NotAllowedError' ? 'permission was refused.' : (e && e.message) || e), 'bad'); return; }
@@ -608,7 +633,7 @@
   async function showPhoto(i, c) {
     var p = photos[i]; if (!p) return;
     c = c || await decode(p.file); if (!c || mode !== 'photo') return;
-    photoIdx = i; photoCanvas = c; tracks = p.tracks; canvas.width = c.width; canvas.height = c.height; stage.style.aspectRatio = c.width + ' / ' + c.height;
+    photoIdx = i; photoCanvas = c; tracks = p.tracks; if (window.FaceFX2) window.FaceFX2.clearMask(); if (fx2On() && window.FaceFX2.needsSeg(S.effect)) segment(c).then(render); canvas.width = c.width; canvas.height = c.height; stage.style.aspectRatio = c.width + ' / ' + c.height;
     resolveIdentities(tracks, true); renderStrip(); render(); pill();
   }
   function renderStrip() {
@@ -916,12 +941,15 @@
   });
   (function buildFx() {
     var row = $('fxRow'); if (!row || !window.FaceFX) return;
-    window.FaceFX.list.forEach(function (e) {
+    var all = (window.FaceFX2 ? window.FaceFX2.list : [['none', '⭕', 'None']]).concat([['_', '', 'Classic']]).concat(window.FaceFX.list.filter(function (e) { return e[0] !== 'none'; }));
+    all.forEach(function (e) {
+      if (e[0] === '_') { row.appendChild(el('span', 'fxsep', e[2])); return; }
       var b = el('button', 'fx' + (S.effect === e[0] ? ' on' : '')); b.type = 'button'; b.dataset.fx = e[0];
       b.appendChild(el('span', 'ic', e[1])); b.appendChild(el('span', '', e[2]));
       b.addEventListener('click', function () {
         S.effect = e[0]; saveSettings();
         row.querySelectorAll('button').forEach(function (x) { x.classList.toggle('on', x.dataset.fx === S.effect); });
+        if (window.FaceFX2 && window.FaceFX2.needsSeg(S.effect) && mode === 'photo' && photoCanvas) segment(photoCanvas).then(render);
         if (mode === 'photo') render();
       });
       row.appendChild(b);

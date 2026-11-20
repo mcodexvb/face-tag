@@ -18,7 +18,8 @@ Two engine instances share the work. A light detector runs on every frame and fe
 - Blur strangers: pixelates everyone who is not a saved person, live and in snapshots
 - Tag many photos at once and see who appears in which
 - Session log with time in view, CSV export, snapshot to PNG, optional spoken greetings
-- Fun face effects that follow every face live (and on photos): shades, big eyes, bobblehead, funhouse mirror, face swap between two people, a mood emoji that follows your expression, puppy (open your mouth for the tongue), tiger, clown, raja (crown and moustache), alien, laser eyes and party hats (smile for confetti). A Labels switch hides name tags while you play
+- Studio effects on the GPU (WebGL 2): neon face mesh, hologram, alpona face art and glow paint mapped onto the face's own texture, comic shader, smooth big-eye lens, glitch, portrait blur, space backdrop and gold statue (person segmentation), clone trails, and fire breath when you open your mouth
+- Classic fun face effects that follow every face live (and on photos): shades, big eyes, bobblehead, funhouse mirror, face swap between two people, a mood emoji that follows your expression, puppy (open your mouth for the tongue), tiger, clown, raja (crown and moustache), alien, laser eyes and party hats (smile for confetti). A Labels switch hides name tags while you play
 - Encrypted backup and restore, installable on a phone, works offline after the first load
 
 ## Air Instruments
@@ -42,7 +43,7 @@ Two engine instances share the work. A light detector runs on every frame and fe
 
 ## Tech
 
-Sample credits are in `samples/README.md`.
+Sample credits are in `samples/README.md`. Person segmentation uses MediaPipe Selfie through Human (`models/selfie.*`); the face mesh texture map and triangles (`meshdata.js`) come from Human's face mesh coordinates.
 
 
 [Human](https://github.com/vladmandic/human) by Vladimir Mandic (MIT) on TensorFlow.js: BlazeFace, FaceMesh, FaceRes, emotion and anti-spoof models. The engine (`lib/human.js`) and models (`models/`) are included, so the page needs no CDN.
