@@ -9,6 +9,7 @@
   var CDN_MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/human-models@3.0.4/models/';
   var MODELS = location.protocol === 'file:' ? CDN_MODELS : './models/';
   var Q = new URLSearchParams(location.search), FORCE_BACKEND = Q.get('backend'), WASM_PATH = Q.get('wasm');   // for testing
+  var MP_PATH = 'lib/mediapipe-hands/', VERSION = '7';
 
   var DEFAULTS = { mode: 'strings', tone: 'acoustic', scale: 'minpent', key: 9, names: 'western', chords: 'pop',
                    snap: true, skeleton: true, reverb: true, lefty: false, quality: 'full' };
@@ -50,7 +51,7 @@
   var video = $('video'), canvas = $('cv'), ctx = canvas.getContext('2d');
   var W = 1280, H = 720, DIAG = Math.hypot(W, H);
   canvas.width = W; canvas.height = H;
-  var human = null, ready = false, running = false, gen = 0, stream = null, facing = 'user', wakeLock = null;
+  var human = null, mpHands = null, mpResult = null, engine = null, ready = false, running = false, gen = 0, stream = null, facing = 'user', wakeLock = null;
   var hands = [], handSeq = 0;
   var strings = [], live = null, holdDel = null, strSeq = 0;
   var strum = [], chordIdx = 0, zones = [];
@@ -189,7 +190,27 @@
     if (WASM_PATH) c.wasmPath = WASM_PATH;
     return c;
   }
+  /* Primary engine: Google MediaPipe Hands (Apache-2.0), bundled in lib/mediapipe-hands.
+     It tracks each hand from frame to frame on the GPU, so it is fast and steady on phones.
+     Fallback: Human's hand models, used only if MediaPipe cannot start. */
+  async function initMP() {
+    var mp = new window.Hands({ locateFile: function (f) { return MP_PATH + f; } });
+    mp.setOptions({ maxNumHands: 2, modelComplexity: S.quality === 'lite' ? 0 : 1, minDetectionConfidence: 0.55, minTrackingConfidence: 0.5, selfieMode: false });
+    mp.onResults(function (r) { mpResult = r; });
+    await mp.initialize();
+    var c = document.createElement('canvas'); c.width = c.height = 64; c.getContext('2d').fillRect(0, 0, 64, 64);
+    await mp.send({ image: c });                                          // compiles the GPU programs before the camera starts
+    return mp;
+  }
+  function loadScript(src) {
+    return new Promise(function (res, rej) { var sc = document.createElement('script'); sc.src = src; sc.onload = res; sc.onerror = function () { rej(new Error('could not load ' + src)); }; document.head.appendChild(sc); });
+  }
   async function initEngine() {
+    if (Q.get('engine') !== 'human' && window.Hands) {
+      try { mpHands = await initMP(); engine = 'mp'; ready = true; pill(); showVersion(); return; }
+      catch (e) { console.warn('MediaPipe could not start, using the fallback engine', e); mpHands = null; }
+    }
+    if (!window.Human) await loadScript('lib/human.js');
     var Hm = window.Human && (window.Human.Human || window.Human);
     human = new Hm(cfg());
     var order = ['webgl', 'wasm', 'cpu'], ok = false;
@@ -197,7 +218,19 @@
     for (var i = 0; i < order.length && !ok; i++) { try { human.config.backend = order[i]; await human.init(); ok = human.tf.getBackend() === order[i]; } catch (e) { ok = false; } }
     await human.load();
     try { await human.warmup(); } catch (e) {}
-    ready = true; pill();
+    engine = 'human'; ready = true; pill(); showVersion();
+  }
+  function showVersion() { var v = $('ver'); if (v) v.textContent = 'Version ' + VERSION + ' · hand tracking: ' + (engine === 'mp' ? 'MediaPipe' : 'Human (fallback)'); }
+  async function detectNow(mirror) {
+    if (engine === 'mp') {
+      mpResult = null; await mpHands.send({ image: video });
+      var r = mpResult || {};
+      return (r.multiHandLandmarks || []).map(function (lm) { return lm.map(function (q) { var x = q.x * W; return [mirror ? W - x : x, q.y * H]; }); });
+    }
+    var res = await human.detect(video);
+    // the detector's box score is often low for real hands; the finger model's own score is the reliable signal
+    return (res.hand || []).filter(function (h) { return h.keypoints && h.keypoints.length === 21 && (h.fingerScore || 0) + 0.5 * (h.score || 0) >= 0.7; })
+      .map(function (h) { return h.keypoints.map(function (q) { return [mirror ? W - q[0] : q[0], q[1]]; }); });
   }
   function palm(p) { var x = 0, y = 0; [0, 5, 9, 13, 17].forEach(function (i) { x += p[i][0]; y += p[i][1]; }); return [x / 5, y / 5]; }
   /* dets: arrays of 21 [x, y] points already in screen (mirrored) coordinates. */
@@ -213,7 +246,8 @@
     uniq.forEach(function (d, di) {
       if (usedD[di]) return;
       var beta = 5 / DIAG, h = { id: ++handSeq, filt: [], pts: null, prev: null, pinch: false, seen: now, releasedAt: 0, born: now, hits: 0 };
-      for (var i = 0; i < 21; i++) h.filt.push([new OneEuro(1.6, beta), new OneEuro(1.6, beta)]);
+      var mc = engine === 'mp' ? 3.5 : 1.6; beta = (engine === 'mp' ? 14 : 5) / DIAG;      // MediaPipe is steadier, so it needs less smoothing (less lag)
+      for (var i = 0; i < 21; i++) h.filt.push([new OneEuro(mc, beta), new OneEuro(mc, beta)]);
       updateHand(h, d, now); h.prev = null; hands.push(h);
     });
     hands = hands.filter(function (h) { return now - h.seen < 300; });
@@ -222,7 +256,8 @@
   }
   function updateHand(h, d, now) {
     var gap = now - h.seen;
-    h.prev = h.pts && gap < 260 ? h.pts : null;                        // only compare with a recent reading: no phantom sweeps
+    var maxGap = Math.max(260, Math.min(700, 2.5 * 1000 / Math.max(fps, 1)));   // slower devices get a longer allowance
+    h.prev = h.pts && gap < maxGap ? h.pts : null;                      // only compare with a recent reading: no phantom sweeps
     h.dt = Math.max(1, gap);
     h.pts = d.p.map(function (k, i) { return [h.filt[i][0].f(k[0], now), h.filt[i][1].f(k[1], now)]; });
     h.c = palm(h.pts); h.s = Math.max(8, dist(h.pts[0], h.pts[9])); h.seen = now; h.hits = (h.hits || 0) + 1;
@@ -257,7 +292,7 @@
     L.a = a.slice(); L.b = b.slice(); L.len = len; L.midi = m;
   }
   function commit(L, now) {
-    if (!L || L.len < 0.1 * DIAG || now - L.born < 120) return null;
+    if (!L || L.len < 0.1 * DIAG || now - L.born < 280) return null;     // a brief accidental double pinch makes no string
     var s = { id: ++strSeq, a: L.a, b: L.b, len: L.len, midi: L.midi, vib: [], last: 0, quietUntil: now + 350, born: now };
     strings.push(s); stats.made++;
     while (strings.length > MAX_STRINGS) { burst(strings[0], 18); strings.shift(); }
@@ -331,7 +366,7 @@
     if (S.mode === 'strings') interactStrings(now); else interactStrum(now);
     hands.forEach(function (h) {
       if (!h.prev || h.pinch || now - h.releasedAt < 250) return;
-      [8, 12].forEach(function (k) { sweep(h.prev[k], h.pts[k], h.dt, now); });
+      (S.mode === 'strum' ? [8] : [8, 12]).forEach(function (k) { sweep(h.prev[k], h.pts[k], h.dt, now); });   // strumming: one fingertip, like a pick
     });
   }
 
@@ -506,18 +541,12 @@
     while (running && g === gen) {
       if (video.readyState >= 2 && video.videoWidth) {
         setSize(video.videoWidth, video.videoHeight);
-        var t0 = performance.now(), res;
-        try { res = await human.detect(video); } catch (e) { status('Tracking error: ' + (e && e.message ? e.message : e), 'bad'); await sleep(300); continue; }
+        var t0 = performance.now(), dets, mirror = facing === 'user';
+        try { dets = await detectNow(mirror); } catch (e) { status('Tracking error: ' + (e && e.message ? e.message : e), 'bad'); await sleep(300); continue; }
         if (!running || g !== gen) return;
         var now = performance.now();
         if (lastDet) { var inst = 1000 / (now - lastDet); fps = fps ? fps * 0.85 + inst * 0.15 : inst; } lastDet = now;
-        if (!testHold) {
-          var mirror = facing === 'user';
-          // the detector's box score is often low for real hands; the finger model's own score is the reliable signal
-          var dets = (res.hand || []).filter(function (h) { return h.keypoints && h.keypoints.length === 21 && (h.fingerScore || 0) + 0.5 * (h.score || 0) >= 0.7; })
-            .map(function (h) { return h.keypoints.map(function (q) { return [mirror ? W - q[0] : q[0], q[1]]; }); });
-          processHands(dets, now);
-        }
+        if (!testHold) processHands(dets, now);
         pill(); status(hint());
         await sleep(Math.max(1, 16 - (now - t0)));                       // always yield, so drawing and touch stay responsive
       } else await sleep(50);
@@ -595,6 +624,7 @@
         if (p[1] === 'tone') { bufCache = {}; cacheKeys = []; applyTone(); }
         if (p[1] === 'scale' || p[1] === 'key') retune();
         if (p[1] === 'chords') { chordIdx = 0; layoutStrum(); }
+        if (p[1] === 'quality' && engine === 'mp') { mpHands.setOptions({ modelComplexity: S.quality === 'lite' ? 0 : 1 }); return; }
         if (p[1] === 'quality' && human) { human.config.hand.skeleton.modelPath = S.quality === 'lite' ? 'handlandmark-lite.json' : 'handlandmark-full.json'; reloadModels(); }
       });
     });
@@ -622,7 +652,6 @@
   /* ================= boot ================= */
   fillSelects(); layoutStrum(); setMode(S.mode); requestAnimationFrame(render);
   (async function () {
-    if (typeof window.Human === 'undefined') { status('Hand tracking did not load. Check the connection and reload. You can still play by touch.', 'bad'); return; }
     try { await initEngine(); status('Ready. Press Start, or play by touch.'); }
     catch (e) { status('Hand tracking could not load: ' + (e && e.message ? e.message : e) + '. You can still play by touch.', 'bad'); }
   })();
@@ -631,7 +660,7 @@
   window.AirGuitar = {   // for testing
     feed: function (dets, t) { processHands(dets, t || performance.now()); }, hold: function (v) { testHold = v; }, setSize: setSize,
     get hands() { return hands; }, get strings() { return strings; }, get strum() { return strum; }, get live() { return live; },
-    get chord() { return CHORD_SETS[S.chords][chordIdx]; }, stats: stats, S: S, get human() { return human; },
+    get chord() { return CHORD_SETS[S.chords][chordIdx]; }, stats: stats, S: S, get human() { return human; }, get engine() { return engine; },
     lengthToMidi: lengthToMidi, initAudio: initAudio, ksBuffer: function (f, u, v) { initAudio(); return ksBuffer(f, u, v); }, get ac() { return ac; }
   };
 })();

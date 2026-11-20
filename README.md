@@ -27,6 +27,7 @@ Two engine instances share the work. A light detector runs on every frame and fe
 - **Make strings:** pinch thumb and index finger on both hands and pull apart to stretch a string, with a ruler showing the note. Open your fingers to leave it in the air, then sweep a fingertip through it to pluck. Pitch follows the physics of a real string (f ∝ 1/L), optionally snapped to a scale, including Raag Yaman, Bhairav and Bhupali. Pinch one string and hold to delete it.
 - **Strum guitar:** point at a chord with one hand and strum six strings with the other. Strings sound in the order your fingers cross them, like a real strum. Choose pop, folk or power-chord sets, and switch to left-handed.
 - Sounds: acoustic, electric with overdrive, harp and sitar-like, synthesised in the browser by Karplus-Strong with exact tuning and pick-position timbre.
+- Hand tracking: Google MediaPipe Hands (Apache-2.0), bundled in `lib/mediapipe-hands` so it needs no CDN. It runs on the phone's GPU and follows each hand from frame to frame. Human's hand models are the fallback if MediaPipe cannot start.
 - Hand skeleton overlay, sparks and vibrating strings, Western or sargam note names, touch play (two fingers stretch a string, one finger plucks) and video recording with sound.
 
 ## Tech
