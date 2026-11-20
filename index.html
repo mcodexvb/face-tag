@@ -50,6 +50,11 @@
   #strip button.cur { outline:2px solid var(--accent); }
   #strip img { width:100%; height:100%; object-fit:cover; display:block; }
   #strip span { position:absolute; right:3px; bottom:3px; background:rgba(0,0,0,.75); border-radius:99px; font-size:11px; padding:0 6px; }
+  .fxrow { display:flex; gap:8px; overflow-x:auto; padding:10px 2px 4px; scrollbar-width:none; }
+  .fxrow::-webkit-scrollbar { display:none; }
+  .fxrow button.fx { flex:none; display:flex; flex-direction:column; align-items:center; gap:2px; min-width:66px; padding:7px 6px; font-size:11.5px; color:var(--dim); border-radius:12px; }
+  .fxrow button.fx .ic { font-size:24px; line-height:1.15; }
+  .fxrow button.fx.on { border-color:var(--accent); color:var(--text); background:var(--panel2); box-shadow:0 0 0 1px var(--accent) inset; }
   .tabs { display:flex; gap:4px; margin-top:16px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:4px; }
   .tabs button { flex:1; border:0; background:transparent; color:var(--dim); padding:8px 6px; border-radius:9px; font-weight:600; }
   .tabs button.on { background:var(--panel2); color:var(--text); }
@@ -129,7 +134,9 @@
     <label><input type="checkbox" data-set="showConf"> Match %</label>
     <label><input type="checkbox" data-set="showMesh"> Mesh</label>
     <label><input type="checkbox" data-set="blurUnknown"> Blur strangers</label>
+    <label><input type="checkbox" data-set="showLabels"> Labels</label>
   </div>
+  <div class="fxrow" id="fxRow"></div>
 
   <div class="tabs" id="tabs">
     <button data-tab="people" class="on">People</button>
@@ -180,6 +187,7 @@
 <div id="toast"></div>
 
 <script src="lib/human.js"></script>
-<script src="app.js?v=6"></script>
+<script src="effects.js?v=10"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>

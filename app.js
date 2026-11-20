@@ -21,7 +21,7 @@
   var QUERY = new URLSearchParams(location.search), FORCE_BACKEND = QUERY.get('backend'), WASM_PATH = QUERY.get('wasm');   // for testing
 
   var DEFAULTS = { threshold: 0.5, res: '720', showAge: true, showGender: true, showEmotion: false, showConf: false, showMesh: false,
-                   blurUnknown: false, announce: false, requireLive: true, thumbs: true, learn: true, guests: true };
+                   blurUnknown: false, announce: false, requireLive: true, thumbs: true, learn: true, guests: true, effect: 'none', showLabels: true };
   var S = Object.assign({}, DEFAULTS);
   try { Object.assign(S, JSON.parse(localStorage.getItem('facetag-settings-v3') || localStorage.getItem('facetag-settings-v2') || '{}')); } catch (e) {}
   function saveSettings() { try { localStorage.setItem('facetag-settings-v3', JSON.stringify(S)); } catch (e) {} }
@@ -31,6 +31,8 @@
   var crop = document.createElement('canvas'), cropCtx = crop.getContext('2d');
   var qCan = document.createElement('canvas'); qCan.width = qCan.height = 48; var qCtx = qCan.getContext('2d', { willReadFrequently: true });
   var pix = document.createElement('canvas'); pix.width = pix.height = 10; var pixCtx = pix.getContext('2d');
+  var frameCan = document.createElement('canvas'), frameCtx = frameCan.getContext('2d'), fxMsg = '';
+  function fxOn() { return S.effect && S.effect !== 'none' && window.FaceFX; }
   var humanA = null, humanB = null, ready = false;
   var running = false, loopGen = 0, facing = 'user', stream = null, wakeLock = null, torchOn = false;
   var mode = 'camera';                 // 'camera' | 'photo'
@@ -251,7 +253,9 @@
         t.vx = 0.5 * t.vx + 0.5 * nvx; t.vy = 0.5 * t.vy + 0.5 * nvy;
       }
       t.box.x += (d.x - t.box.x) * a; t.box.y += (d.y - t.box.y) * a; t.box.w += (d.w - t.box.w) * a; t.box.h += (d.h - t.box.h) * a;
-      t.hits++; t.seen = now; t.mesh = d.mesh; if (t.hits >= 3) t.confirmed = true;
+      t.hits++; t.seen = now; if (t.hits >= 3) t.confirmed = true;
+      if (d.mesh && t.mesh && d.mesh.length === t.mesh.length) t.mesh = d.mesh.map(function (p, i) { var q = t.mesh[i]; return [q[0] + (p[0] - q[0]) * 0.6, q[1] + (p[1] - q[1]) * 0.6, p[2]]; });   // light smoothing: effects stay steady
+      else t.mesh = d.mesh;
     });
     tracks.forEach(function (t, ti) { if (!usedT[ti]) { t.vx *= 0.5; t.vy *= 0.5; } });
     dets.forEach(function (d, di) { if (!usedD[di]) tracks.push(newTrack(d, now)); });
@@ -438,6 +442,20 @@
     if (mode === 'photo' && photoCanvas) ctx.drawImage(photoCanvas, 0, 0, W, H);
     var rect = canvas.getBoundingClientRect(), k = rect.width ? 1 / Math.min(rect.width / W, rect.height / H) : 1;   // canvas px per CSS px
     var list = tracks.filter(isVisible).sort(function (a, b) { return a.box.y - b.box.y; }), placed = [];
+    fxMsg = '';
+    if (fxOn() && (mode === 'photo' ? photoCanvas : video.readyState >= 2)) {
+      var pic = photoCanvas;
+      if (mode === 'camera') {                                              // the effects draw onto the picture itself
+        if (frameCan.width !== W || frameCan.height !== H) { frameCan.width = W; frameCan.height = H; }
+        frameCtx.save(); if (mirror) { frameCtx.translate(W, 0); frameCtx.scale(-1, 1); } frameCtx.drawImage(video, 0, 0, W, H); frameCtx.restore();
+        ctx.drawImage(frameCan, 0, 0); pic = frameCan;
+      }
+      var faces = list.filter(function (t) { return t.mesh && t.mesh.length >= 468; }).map(function (t) {
+        return { id: t.id, emotion: t.emotion, mesh: mirror ? t.mesh.map(function (p) { return [W - p[0], p[1]]; }) : t.mesh };
+      });
+      try { fxMsg = window.FaceFX.draw(ctx, pic, W, H, faces, S.effect, performance.now()) || ''; } catch (e) { fxMsg = ''; }
+      if (!S.showLabels) return;
+    } else if (!S.showLabels) return;
     list.forEach(function (t) { t.dx = mirror ? W - t.box.x - t.box.w : t.box.x; placed.push({ x: t.dx, y: t.box.y, w: t.box.w, h: t.box.h }); });
     list.forEach(function (t) {
       var b = t.box, x = t.dx, col = colorOf(t);
@@ -496,7 +514,7 @@
       try {
         var vw = video.videoWidth, vh = video.videoHeight;
         if (canvas.width !== vw || canvas.height !== vh) { canvas.width = vw; canvas.height = vh; stage.style.aspectRatio = vw + ' / ' + vh; }
-        if (humanA.config.face.mesh.enabled !== !!S.showMesh) humanA.config.face.mesh.enabled = !!S.showMesh;
+        var wantMesh = !!S.showMesh || !!fxOn(); if (humanA.config.face.mesh.enabled !== wantMesh) humanA.config.face.mesh.enabled = wantMesh;
         var t0 = performance.now(), res = await humanA.detect(video);
         if (!running || gen !== loopGen) return;
         var now = performance.now(), dtMs = lastFrame ? now - lastFrame : 0;
@@ -511,7 +529,7 @@
         }
         resolveIdentities(tracks, false); afterResolve(now, dtMs); render(); pill();
         if (tracks.length) lastFaceAt = now; idle = now - lastFaceAt > 6000;
-        if (!enrol) status(hint());
+        if (!enrol) status(fxMsg && fxOn() ? fxMsg : hint());
       } catch (e) { status('Detection error: ' + (e && e.message ? e.message : e), 'bad'); idle = true; }
     }
     if (idle) setTimeout(function () { loop(gen); }, 220); else requestAnimationFrame(function () { loop(gen); });
@@ -547,7 +565,7 @@
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url); return c;
   }
   async function analysePhoto(c, label) {
-    humanA.config.face.detector.maxDetected = 40; humanA.config.face.mesh.enabled = false;
+    humanA.config.face.detector.maxDetected = 40; humanA.config.face.mesh.enabled = true;          // the mesh lets effects work on photos too
     var res; try { res = await humanA.detect(c); } finally { humanA.config.face.detector.maxDetected = 12; }
     var dets = toDets(res.face), list = [], now = performance.now();
     for (var i = 0; i < dets.length; i++) {
@@ -896,6 +914,19 @@
       if (b.dataset.tab === 'session') renderSession();
     });
   });
+  (function buildFx() {
+    var row = $('fxRow'); if (!row || !window.FaceFX) return;
+    window.FaceFX.list.forEach(function (e) {
+      var b = el('button', 'fx' + (S.effect === e[0] ? ' on' : '')); b.type = 'button'; b.dataset.fx = e[0];
+      b.appendChild(el('span', 'ic', e[1])); b.appendChild(el('span', '', e[2]));
+      b.addEventListener('click', function () {
+        S.effect = e[0]; saveSettings();
+        row.querySelectorAll('button').forEach(function (x) { x.classList.toggle('on', x.dataset.fx === S.effect); });
+        if (mode === 'photo') render();
+      });
+      row.appendChild(b);
+    });
+  })();
   window.addEventListener('resize', function () { if (mode === 'photo') render(); });
   document.addEventListener('visibilitychange', async function () {
     if (!document.hidden && running && !wakeLock) { try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {} }
@@ -913,6 +944,6 @@
     try { await initEngine(); changed(); status('Ready. Start the camera or open photos.'); }
     catch (e) { status('Face models could not load: ' + (e && e.message ? e.message : e), 'bad'); }
     window.FaceTag = { get tracks() { return tracks; }, get people() { return people; }, get guests() { return guests; }, get sess() { return sess; },
-      visible: function () { return tracks.filter(isVisible); }, saveAs: saveAs, goodEmbs: goodEmbs, openFace: openFace, labelOf: labelOf, S: S };
+      visible: function () { return tracks.filter(isVisible); }, setEffect: function (e) { var b = document.querySelector('[data-fx="' + e + '"]'); if (b) b.click(); }, saveAs: saveAs, goodEmbs: goodEmbs, openFace: openFace, labelOf: labelOf, S: S };
   })();
 })();
