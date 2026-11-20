@@ -184,7 +184,7 @@
   function cfg() {
     var c = { modelBasePath: MODELS, backend: 'webgl', debug: false, cacheSensitivity: 0.7, filter: { enabled: true, equalization: false, flip: false },
       face: { enabled: false }, body: { enabled: false }, object: { enabled: false }, gesture: { enabled: false }, segmentation: { enabled: false },
-      hand: { enabled: true, rotation: true, skipFrames: 8, skipTime: 350, minConfidence: 0.55, iouThreshold: 0.2, maxDetected: 2, landmarks: false,
+      hand: { enabled: true, rotation: true, skipFrames: 0, skipTime: 0, minConfidence: 0.2, iouThreshold: 0.2, maxDetected: 2, landmarks: true,
         detector: { modelPath: 'handtrack.json' }, skeleton: { modelPath: S.quality === 'lite' ? 'handlandmark-lite.json' : 'handlandmark-full.json' } } };
     if (WASM_PATH) c.wasmPath = WASM_PATH;
     return c;
@@ -212,19 +212,20 @@
     pairs.forEach(function (q) { if (usedH[q.hi] || usedD[q.di]) return; usedH[q.hi] = usedD[q.di] = true; updateHand(hands[q.hi], uniq[q.di], now); });
     uniq.forEach(function (d, di) {
       if (usedD[di]) return;
-      var beta = 5 / DIAG, h = { id: ++handSeq, filt: [], pts: null, prev: null, pinch: false, seen: now, releasedAt: 0, born: now };
+      var beta = 5 / DIAG, h = { id: ++handSeq, filt: [], pts: null, prev: null, pinch: false, seen: now, releasedAt: 0, born: now, hits: 0 };
       for (var i = 0; i < 21; i++) h.filt.push([new OneEuro(1.6, beta), new OneEuro(1.6, beta)]);
       updateHand(h, d, now); h.prev = null; hands.push(h);
     });
     hands = hands.filter(function (h) { return now - h.seen < 300; });
-    interact(now);
+    var all = hands; hands = all.filter(function (h) { return h.hits >= 2; });
+    interact(now); hands = all;
   }
   function updateHand(h, d, now) {
     var gap = now - h.seen;
     h.prev = h.pts && gap < 260 ? h.pts : null;                        // only compare with a recent reading: no phantom sweeps
     h.dt = Math.max(1, gap);
     h.pts = d.p.map(function (k, i) { return [h.filt[i][0].f(k[0], now), h.filt[i][1].f(k[1], now)]; });
-    h.c = palm(h.pts); h.s = Math.max(8, dist(h.pts[0], h.pts[9])); h.seen = now;
+    h.c = palm(h.pts); h.s = Math.max(8, dist(h.pts[0], h.pts[9])); h.seen = now; h.hits = (h.hits || 0) + 1;
     var r = dist(h.pts[4], h.pts[8]) / h.s, was = h.pinch;
     h.pinch = was ? r < 0.48 : r < 0.32;                                 // hysteresis: no flicker at the edge
     if (was && !h.pinch) h.releasedAt = now;
@@ -425,6 +426,7 @@
   }
   function drawHands(k) {
     hands.forEach(function (h) {
+      if (h.hits < 2) return;
       if (S.skeleton) {
         ctx.strokeStyle = 'rgba(74,222,128,.9)'; ctx.lineWidth = 2.2 * k; ctx.lineCap = 'round';
         BONES.forEach(function (bn) { ctx.beginPath(); ctx.moveTo(h.pts[bn[0]][0], h.pts[bn[0]][1]); ctx.lineTo(h.pts[bn[1]][0], h.pts[bn[1]][1]); ctx.stroke(); });
@@ -491,10 +493,11 @@
   }
 
   /* ================= camera ================= */
-  function pill() { $('pill').textContent = !ready ? 'loading…' : (running ? (fps < 10 ? fps.toFixed(1) : fps.toFixed(0)) + ' fps · ' + hands.length + (hands.length === 1 ? ' hand' : ' hands') : 'ready'); }
+  function seenHands() { return hands.filter(function (h) { return h.hits >= 2; }); }
+  function pill() { var n = seenHands().length; $('pill').textContent = !ready ? 'loading…' : (running ? (fps < 10 ? fps.toFixed(1) : fps.toFixed(0)) + ' fps · ' + n + (n === 1 ? ' hand' : ' hands') : 'ready'); }
   function hint() {
     if (S.mode === 'strum') return hands.length ? 'Point at a chord with one hand. Sweep the other hand’s fingers across the strings.' : 'Show both hands to the camera.';
-    if (!hands.length) return 'Show your hands to the camera.';
+    if (!seenHands().length) return 'Show your hands to the camera, palms facing it, in good light.';
     if (live) return 'Pull apart to stretch, open your fingers to place the string.';
     if (!strings.length) return 'Pinch thumb and index on both hands, then pull apart.';
     return 'Sweep a fingertip through a string to pluck it. Pinch one string and hold to delete it.';
@@ -510,7 +513,8 @@
         if (lastDet) { var inst = 1000 / (now - lastDet); fps = fps ? fps * 0.85 + inst * 0.15 : inst; } lastDet = now;
         if (!testHold) {
           var mirror = facing === 'user';
-          var dets = (res.hand || []).filter(function (h) { return h.score >= 0.5 && h.keypoints && h.keypoints.length === 21; })
+          // the detector's box score is often low for real hands; the finger model's own score is the reliable signal
+          var dets = (res.hand || []).filter(function (h) { return h.keypoints && h.keypoints.length === 21 && (h.fingerScore || 0) + 0.5 * (h.score || 0) >= 0.7; })
             .map(function (h) { return h.keypoints.map(function (q) { return [mirror ? W - q[0] : q[0], q[1]]; }); });
           processHands(dets, now);
         }
