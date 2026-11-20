@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e13">
+<title>Air Guitar · Face Tag</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<style>
+  :root { --bg:#0b0e13; --panel:#141921; --panel2:#1c232d; --line:#262e3a; --text:#e9edf3; --dim:#93a0b4; --accent:#3ddc97; --accent-ink:#04261a; --warn:#ffb454; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  main { max-width:960px; margin:0 auto; padding:12px 12px 28px; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+  .brand { display:flex; align-items:center; gap:9px; font-weight:700; font-size:18px; }
+  .brand i { width:26px; height:26px; border-radius:8px; border:2px solid var(--accent); display:block; position:relative; }
+  .brand i:after { content:""; position:absolute; left:4px; right:4px; top:10px; height:2px; background:var(--accent); box-shadow:0 -5px 0 var(--accent), 0 5px 0 var(--accent); }
+  .hr { display:flex; align-items:center; gap:8px; }
+  #pill { font-size:12px; color:var(--dim); border:1px solid var(--line); background:var(--panel); border-radius:99px; padding:4px 11px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  a.link { color:var(--dim); font-size:13px; text-decoration:none; border:1px solid var(--line); border-radius:99px; padding:4px 11px; white-space:nowrap; }
+  .stage { position:relative; background:#000; border:1px solid var(--line); border-radius:16px; overflow:hidden; aspect-ratio:16/9; max-height:74vh; margin:0 auto; }
+  .stage canvas { position:absolute; inset:0; width:100%; height:100%; display:block; object-fit:contain; touch-action:none; }
+  video { display:none; }
+  .placeholder { position:absolute; inset:0; display:flex; flex-direction:column; gap:6px; align-items:center; justify-content:center; text-align:center; padding:24px; color:var(--dim); pointer-events:none; }
+  .placeholder b { color:var(--text); font-size:16px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .bar { margin:10px 0 6px; align-items:center; }
+  button, select { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:9px 13px; cursor:pointer; line-height:1.2; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); font-weight:650; }
+  button.rec { color:var(--bad); } button.rec.on { background:var(--bad); border-color:var(--bad); color:#fff; font-weight:650; }
+  button:disabled { opacity:.4; cursor:default; }
+  .seg { display:inline-flex; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:3px; }
+  .seg button { border:0; background:transparent; color:var(--dim); padding:6px 12px; border-radius:8px; font-weight:600; }
+  .seg button.on { background:var(--panel2); color:var(--text); }
+  #status { font-size:13.5px; color:var(--dim); min-height:1.45em; margin:2px 2px 0; }
+  #status.bad { color:var(--bad); }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin:10px 0 0; }
+  .chips label { display:flex; align-items:center; gap:6px; font-size:13px; background:var(--panel); border:1px solid var(--line); border-radius:99px; padding:5px 11px; cursor:pointer; user-select:none; }
+  .chips input { accent-color:var(--accent); margin:0; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:6px 14px 10px; margin-top:12px; }
+  .set { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:9px 0; border-top:1px solid var(--line); font-size:14px; }
+  .set:first-child { border-top:0; }
+  .set small { color:var(--dim); display:block; font-size:12.5px; }
+  .set select { padding:6px 8px; border-radius:8px; background:var(--bg); }
+  .help { color:var(--dim); font-size:13.5px; }
+  .help b { color:var(--text); }
+  .help p { margin:8px 0; }
+  #toast { position:fixed; left:50%; bottom:calc(22px + env(safe-area-inset-bottom)); transform:translateX(-50%); background:#0f151d; border:1px solid var(--line); padding:10px 16px; border-radius:14px; font-size:14px; display:none; z-index:20; max-width:92vw; text-align:center; }
+  @media (max-width:520px) { .bar > button { flex:1 1 28%; padding:10px 6px; } .seg { flex:1 1 100%; } .seg button { flex:1; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand"><i></i>Air Guitar</div>
+    <div class="hr"><span id="pill">loading…</span><a class="link" href="index.html">Face Tag</a></div>
+  </header>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="cv"></canvas>
+    <div class="placeholder" id="placeholder"><b>Camera is off</b><span>Press Start, then pinch with both hands and pull apart to make a string. You can also play by touch.</span></div>
+  </div>
+
+  <div class="row bar">
+    <button class="primary" id="startBtn">Start</button>
+    <button id="flipBtn" disabled>Switch</button>
+    <div class="seg" id="modeSeg"><button data-mode="strings">Make strings</button><button data-mode="strum">Strum guitar</button></div>
+    <button id="undoBtn">Undo</button>
+    <button id="clearBtn">Clear</button>
+    <button class="rec" id="recBtn" disabled>Record</button>
+  </div>
+  <div id="status">Loading hand tracking…</div>
+
+  <div class="chips">
+    <label><input type="checkbox" data-set="skeleton"> Hand skeleton</label>
+    <label><input type="checkbox" data-set="snap"> Snap to scale</label>
+    <label><input type="checkbox" data-set="reverb"> Reverb</label>
+    <label><input type="checkbox" data-set="lefty"> Left-handed</label>
+  </div>
+
+  <div class="panel">
+    <div class="set"><div>Sound</div><select id="tone"><option value="acoustic">Acoustic guitar</option><option value="electric">Electric (overdrive)</option><option value="harp">Harp</option><option value="sitar">Sitar-like</option></select></div>
+    <div class="set"><div>Scale<small>Used when “Snap to scale” is on.</small></div><select id="scale"></select></div>
+    <div class="set"><div>Key</div><select id="key"></select></div>
+    <div class="set"><div>Note names</div><select id="names"><option value="western">C D E…</option><option value="sargam">Sa Re Ga…</option></select></div>
+    <div class="set"><div>Chords for strumming</div><select id="chords"><option value="pop">G D Em C Am F</option><option value="folk">C Am F G Dm E</option><option value="rock">Power chords</option></select></div>
+    <div class="set"><div>Tracking<small>Accurate follows fingers better. Fast suits older phones.</small></div><select id="quality"><option value="full">Accurate</option><option value="lite">Fast</option></select></div>
+  </div>
+
+  <div class="panel help" id="help"></div>
+</main>
+<div id="toast"></div>
+
+<script src="lib/human.js"></script>
+<script src="guitar.js"></script>
+</body>
+</html>

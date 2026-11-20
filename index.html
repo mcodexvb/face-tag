@@ -17,6 +17,7 @@
   .brand { display:flex; align-items:center; gap:9px; font-weight:700; font-size:18px; letter-spacing:.2px; }
   .brand i { width:26px; height:26px; border-radius:8px; border:2px solid var(--accent); display:block; position:relative; }
   .brand i:after { content:""; position:absolute; inset:6px; border-radius:50%; background:var(--accent); }
+  a.navlink { color:var(--text); font-size:13px; text-decoration:none; border:1px solid var(--accent); border-radius:99px; padding:4px 11px; white-space:nowrap; }
   #pill { font-size:12px; color:var(--dim); border:1px solid var(--line); background:var(--panel); border-radius:99px; padding:4px 11px; font-variant-numeric:tabular-nums; white-space:nowrap; }
   .stage { position:relative; background:#000; border:1px solid var(--line); border-radius:16px; overflow:hidden; aspect-ratio:4/3; max-height:72vh; margin:0 auto; }
   .stage video, .stage canvas { position:absolute; inset:0; width:100%; height:100%; display:block; object-fit:contain; }
@@ -96,7 +97,7 @@
 <main>
   <header>
     <div class="brand"><i></i>Face Tag</div>
-    <span id="pill">loading…</span>
+    <div style="display:flex;gap:8px;align-items:center"><span id="pill">loading…</span><a class="navlink" href="air-guitar.html">Air guitar</a></div>
   </header>
 
   <div class="stage" id="stage">

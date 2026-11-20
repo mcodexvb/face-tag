@@ -20,6 +20,15 @@ Two engine instances share the work. A light detector runs on every frame and fe
 - Session log with time in view, CSV export, snapshot to PNG, optional spoken greetings
 - Encrypted backup and restore, installable on a phone, works offline after the first load
 
+## Air Guitar
+
+`air-guitar.html` (the "Air guitar" button in the app) turns the camera into an instrument.
+
+- **Make strings:** pinch thumb and index finger on both hands and pull apart to stretch a string, with a ruler showing the note. Open your fingers to leave it in the air, then sweep a fingertip through it to pluck. Pitch follows the physics of a real string (f ∝ 1/L), optionally snapped to a scale, including Raag Yaman, Bhairav and Bhupali. Pinch one string and hold to delete it.
+- **Strum guitar:** point at a chord with one hand and strum six strings with the other. Strings sound in the order your fingers cross them, like a real strum. Choose pop, folk or power-chord sets, and switch to left-handed.
+- Sounds: acoustic, electric with overdrive, harp and sitar-like, synthesised in the browser by Karplus-Strong with exact tuning and pick-position timbre.
+- Hand skeleton overlay, sparks and vibrating strings, Western or sargam note names, touch play (two fingers stretch a string, one finger plucks) and video recording with sound.
+
 ## Tech
 
 [Human](https://github.com/vladmandic/human) by Vladimir Mandic (MIT) on TensorFlow.js: BlazeFace, FaceMesh, FaceRes, emotion and anti-spoof models. The engine (`lib/human.js`) and models (`models/`) are included, so the page needs no CDN.
