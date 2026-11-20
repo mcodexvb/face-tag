@@ -18,6 +18,7 @@ Two engine instances share the work. A light detector runs on every frame and fe
 - Blur strangers: pixelates everyone who is not a saved person, live and in snapshots
 - Tag many photos at once and see who appears in which
 - Session log with time in view, CSV export, snapshot to PNG, optional spoken greetings
+- Face light (soft studio light and skin smoothing), background removal, devil horns, glowing evil eyes with angry brows, fire aura, Demon and Angel looks
 - Studio effects on the GPU (WebGL 2): neon face mesh, hologram, alpona face art and glow paint mapped onto the face's own texture, comic shader, smooth big-eye lens, glitch, portrait blur, space backdrop and gold statue (person segmentation), clone trails, and fire breath when you open your mouth
 - Classic fun face effects that follow every face live (and on photos): shades, big eyes, bobblehead, funhouse mirror, face swap between two people, a mood emoji that follows your expression, puppy (open your mouth for the tongue), tiger, clown, raja (crown and moustache), alien, laser eyes and party hats (smile for confetti). A Labels switch hides name tags while you play
 - Encrypted backup and restore, installable on a phone, works offline after the first load
