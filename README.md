@@ -24,9 +24,9 @@ Two engine instances share the work. A light detector runs on every frame and fe
 
 `air-guitar.html` (the "Air instruments" button in the app). Besides the strings and guitar below:
 
-- **Keys:** a keyboard along the bottom; each fingertip that crosses the green line plays its own key, so chords work, louder for a faster tap. Piano (additive synthesis with string stiffness and paired strings, optional sustain pedal) or harmonium (sustained reeds, slide along the keys).
-- **Drums:** hi-hat, crash, ride, toms, snare and kick pads struck with quick fingertip flicks.
-- **Tabla:** dayan tuned to Sa (Na on the rim, Tin in the centre, Te beside it) and bayan (Ge, Ke); Na or Tin with Ge give Dha or Dhin, and lifting the hand after a Ge bends the bayan's pitch (meend).
+- **Keys:** bend a finger to press the key it points at, as on a real keyboard; several fingers make a chord and a closed fist is silent. Piano uses recorded Steinway samples (public domain); harmonium is a synthesised free-reed model.
+- **Drums:** a recorded jazz kit (Virtuosity Drums, CC0). A hit lands when the fingertip strikes down and stops, like a stick; sideways, upward or slow movement is silent.
+- **Tabla:** strokes rendered from the instrument's modes (harmonic for the dayan, as C. V. Raman showed; membrane modes for the bayan). Dayan tuned to Sa (Na on the rim, Tin in the centre, Te beside it) and bayan (Ge, Ke); Na or Tin with Ge give Dha or Dhin, and lifting the hand after a Ge bends the bayan's pitch (meend).
 - **Theremin:** one hand sets the pitch, the other the volume; glides along a chosen scale or raag, or fully continuous.
 
 ### Air Guitar
@@ -40,6 +40,9 @@ Two engine instances share the work. A light detector runs on every frame and fe
 - Hand skeleton overlay, sparks and vibrating strings, Western or sargam note names, touch play (two fingers stretch a string, one finger plucks) and video recording with sound.
 
 ## Tech
+
+Sample credits are in `samples/README.md`.
+
 
 [Human](https://github.com/vladmandic/human) by Vladimir Mandic (MIT) on TensorFlow.js: BlazeFace, FaceMesh, FaceRes, emotion and anti-spoof models. The engine (`lib/human.js`) and models (`models/`) are included, so the page needs no CDN.
 

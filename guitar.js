@@ -9,7 +9,7 @@
   var CDN_MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/human-models@3.0.4/models/';
   var MODELS = location.protocol === 'file:' ? CDN_MODELS : './models/';
   var Q = new URLSearchParams(location.search), FORCE_BACKEND = Q.get('backend'), WASM_PATH = Q.get('wasm');   // for testing
-  var MP_PATH = 'lib/mediapipe-hands/', VERSION = '8';
+  var MP_PATH = 'lib/mediapipe-hands/', VERSION = '9';
 
   var DEFAULTS = { mode: 'strings', tone: 'acoustic', scale: 'minpent', key: 9, names: 'western', chords: 'pop',
                    snap: true, skeleton: true, reverb: true, lefty: false, quality: 'full', keys: 'piano', octave: 48, sustain: false };
@@ -106,7 +106,7 @@
     try { recDest = ac.createMediaStreamDestination(); comp.connect(recDest); } catch (e) { recDest = null; }
     applyTone();
     if (ac.state === 'suspended') ac.resume();
-    prewarm();
+    prewarm(); preloadDrums(); preloadPiano(); Object.keys(TABLA).forEach(tablaBuffer);
   }
   function impulse(sec) {
     var sr = ac.sampleRate, n = Math.floor(sr * sec), b = ac.createBuffer(2, n, sr);
@@ -260,6 +260,7 @@
     var gap = now - h.seen;
     var maxGap = Math.max(260, Math.min(700, 2.5 * 1000 / Math.max(fps, 1)));   // slower devices get a longer allowance
     h.prev = h.pts && gap < maxGap ? h.pts : null;                      // only compare with a recent reading: no phantom sweeps
+    h.rawPrev = h.raw && gap < maxGap ? h.raw : null; h.raw = d.p;     // unsmoothed points: strikes need the true moment the finger stops
     h.dt = Math.max(1, gap);
     h.pts = d.p.map(function (k, i) { return [h.filt[i][0].f(k[0], now), h.filt[i][1].f(k[1], now)]; });
     h.c = palm(h.pts); h.s = Math.max(8, dist(h.pts[0], h.pts[9])); h.seen = now; h.hits = (h.hits || 0) + 1;
@@ -386,6 +387,34 @@
   function layoutAll() { layoutStrum(); layoutKeys(); layoutPads(); layoutTabla(); }
   function isBlack(m) { return [1, 3, 6, 8, 10].indexOf(((m % 12) + 12) % 12) >= 0; }
 
+  /* ---------- recorded samples (piano: Splendid Grand Piano, public domain; drums: Virtuosity Drums, CC0) ---------- */
+  var smpCache = {}, smpLoading = {}, pianoIndex = null;
+  function loadSample(url) {
+    if (smpCache[url]) return Promise.resolve(smpCache[url]);
+    if (smpLoading[url]) return smpLoading[url];
+    return (smpLoading[url] = fetch(url).then(function (r) { if (!r.ok) throw new Error(url); return r.arrayBuffer(); })
+      .then(function (b) { return new Promise(function (res, rej) { ac.decodeAudioData(b, res, rej); }); })
+      .then(function (buf) { smpCache[url] = buf; stats.samples = (stats.samples || 0) + 1; return buf; })
+      .catch(function () { delete smpLoading[url]; return null; }));
+  }
+  var DRUM_IDS = ['kick', 'snare', 'hihat', 'crash', 'ride', 'tom1', 'tom2'];
+  function drumUrl(id, layer) { return 'samples/drums/' + id + '-' + layer + '.m4a'; }
+  function preloadDrums() { if (!ac) return; DRUM_IDS.forEach(function (id) { loadSample(drumUrl(id, 1)); loadSample(drumUrl(id, 2)); }); }
+  function loadPianoIndex() {
+    if (pianoIndex || !ac) return Promise.resolve(pianoIndex);
+    return fetch('samples/piano/index.json').then(function (r) { return r.json(); }).then(function (j) { pianoIndex = j; return j; }).catch(function () { return null; });
+  }
+  function pianoSample(midi, loud) {
+    if (!pianoIndex) return null;
+    var list = pianoIndex[loud ? 'loud' : 'soft'], best = null;
+    list.forEach(function (m) { if (best === null || Math.abs(m - midi) < Math.abs(best - midi)) best = m; });
+    return best === null ? null : { midi: best, url: 'samples/piano/' + (loud ? 'loud' : 'soft') + '-' + best + '.m4a' };
+  }
+  function preloadPiano() {
+    if (!ac || S.keys !== 'piano') return;
+    loadPianoIndex().then(function () { keys.forEach(function (k) { [false, true].forEach(function (l) { var s = pianoSample(k.midi, l); if (s) loadSample(s.url); }); }); });
+  }
+
   /* ---------- keys ---------- */
   function layoutKeys() {
     var land = W >= H, nWhite = land ? 15 : 10, y0 = H * (land ? 0.6 : 0.68), y1 = H * 0.975, kw = W / nWhite, m = S.octave, wi = 0, whites = [], blacks = [];
@@ -433,18 +462,28 @@
     if (ac.createStereoPanner) { var p = ac.createStereoPanner(); p.pan.value = clamp((x / W) * 2 - 1, -1, 1) * 0.5; p.connect(master); return p; }
     var g = ac.createGain(); g.connect(master); return g;
   }
+  var reedWaves = {};
+  function reedWave(midi) {                                                // free-reed spectrum: rich harmonics, a resonance near 1.3 kHz
+    var key = Math.round(midi); if (reedWaves[key]) return reedWaves[key];
+    var f = mtof(midi), N = 40, re = new Float32Array(N + 1), im = new Float32Array(N + 1);
+    for (var n = 1; n <= N; n++) { var fn = f * n; if (fn > 12000) break; var form = 1 + 1.6 * Math.exp(-Math.pow(Math.log(fn / 1300), 2) / 0.35) + 0.6 * Math.exp(-Math.pow(Math.log(fn / 2800), 2) / 0.25); im[n] = Math.pow(n, -0.75) * form * (n % 2 ? 1 : 0.8); }
+    return (reedWaves[key] = ac.createPeriodicWave(re, im));
+  }
   function harmoniumVoice(midi, vel, dest) {
-    var t = ac.currentTime, f = mtof(midi), g = ac.createGain(), lpf = ac.createBiquadFilter(), fm = ac.createBiquadFilter();
-    lpf.type = 'lowpass'; lpf.frequency.value = Math.min(6000, f * 9); lpf.Q.value = 0.6;
-    fm.type = 'peaking'; fm.frequency.value = 1250; fm.Q.value = 1.1; fm.gain.value = 6;               // the reed chamber's resonance
-    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.11 + 0.07 * vel, t + 0.07);
-    var oscs = [['sawtooth', 1, -6, 1], ['sawtooth', 1, 7, 1], ['square', 0.5, 0, 0.35]].map(function (d) {
-      var o = ac.createOscillator(), og = ac.createGain(); o.type = d[0]; o.frequency.value = f * d[1]; o.detune.value = d[2]; og.gain.value = d[3];
-      o.connect(og); og.connect(lpf); o.start(t); return o;
+    var t = ac.currentTime, f = mtof(midi), g = ac.createGain(), lpf = ac.createBiquadFilter();
+    lpf.type = 'lowpass'; lpf.frequency.value = 7000; lpf.Q.value = 0.5;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.06 + 0.04 * vel, t + 0.05); g.gain.setTargetAtTime(0.055 + 0.035 * vel, t + 0.05, 0.3);
+    var nodes = [[1, -5, 1], [1, 6, 0.85], [0.5, 0, 0.55]].map(function (d) {
+      var o = ac.createOscillator(), og = ac.createGain(); o.setPeriodicWave(reedWave(midi + 12 * Math.log2(d[0])));
+      o.frequency.setValueAtTime(f * d[0] * 0.994, t); o.frequency.exponentialRampToValueAtTime(f * d[0], t + 0.06);   // reeds speak a touch flat
+      o.detune.value = d[1]; og.gain.value = d[2]; o.connect(og); og.connect(lpf); o.start(t); return o;
     });
-    var lfo = ac.createOscillator(), lg = ac.createGain(); lfo.frequency.value = 5.2; lg.gain.value = 0.01; lfo.connect(lg); lg.connect(g.gain); lfo.start(t); oscs.push(lfo);   // bellows
-    lpf.connect(fm); fm.connect(g); g.connect(dest);
-    return { stop: function () { var t2 = ac.currentTime; g.gain.cancelScheduledValues(t2); g.gain.setTargetAtTime(0, t2, 0.06); oscs.forEach(function (o) { try { o.stop(t2 + 0.5); } catch (e) {} }); } };
+    var br = ac.createBufferSource(), bf = ac.createBiquadFilter(), bg = ac.createGain();   // air through the reeds
+    br.buffer = noiseBuffer(); br.loop = true; bf.type = 'bandpass'; bf.frequency.value = 1800; bf.Q.value = 0.8; bg.gain.value = 0.05;
+    br.connect(bf); bf.connect(bg); bg.connect(g); br.start(t, Math.random() * 0.5); nodes.push(br);
+    var lfo = ac.createOscillator(), lg = ac.createGain(); lfo.frequency.value = 4.6; lg.gain.value = 0.006; lfo.connect(lg); lg.connect(g.gain); lfo.start(t); nodes.push(lfo);   // bellows
+    lpf.connect(g); g.connect(dest);
+    return { stop: function () { var t2 = ac.currentTime; g.gain.cancelScheduledValues(t2); g.gain.setTargetAtTime(0, t2, 0.05); nodes.forEach(function (o) { try { o.stop(t2 + 0.4); } catch (e) {} }); } };
   }
   function keyNoteOn(k, vel) {
     k.on++; k.t = performance.now(); stats.plays++; stats.keys = (stats.keys || 0) + 1;
@@ -452,28 +491,38 @@
     var dest = mkPan(k.x + k.w / 2);
     if (S.keys === 'harmonium') return harmoniumVoice(k.midi, vel, dest);
     var t = ac.currentTime, src = ac.createBufferSource(), lpf = ac.createBiquadFilter(), g = ac.createGain();
-    src.buffer = pianoBuffer(k.midi); lpf.type = 'lowpass'; lpf.frequency.value = Math.min(16000, mtof(k.midi) * (2.5 + 14 * vel)); g.gain.value = 0.15 + 0.85 * vel * vel;
+    var smp = pianoSample(k.midi, vel > 0.62), buf = smp && smpCache[smp.url];
+    if (buf) { src.buffer = buf; src.playbackRate.value = Math.pow(2, (k.midi - smp.midi) / 12); lpf.frequency.value = 18000; g.gain.value = 0.35 + 0.75 * vel; }
+    else { src.buffer = pianoBuffer(k.midi); lpf.frequency.value = Math.min(16000, mtof(k.midi) * (2.5 + 14 * vel)); g.gain.value = 0.15 + 0.85 * vel * vel; if (smp) loadSample(smp.url); }
+    lpf.type = 'lowpass';
     src.connect(lpf); lpf.connect(g); g.connect(dest); src.start(t);
     return { stop: function () { var t2 = ac.currentTime; g.gain.cancelScheduledValues(t2); g.gain.setTargetAtTime(0, t2, 0.07); try { src.stop(t2 + 0.6); } catch (e) {} } };
   }
   function keyNoteOff(k, v) { k.on = Math.max(0, k.on - 1); if (v && !(S.keys === 'piano' && S.sustain)) v.stop(); }
+  var FINGERS = [[8, 5], [12, 9], [16, 13], [20, 17]];                    // fingertip, knuckle
+  function flexRatio(h, f) { var w = h.pts[0]; return dist(h.pts[f[0]], w) / Math.max(1, dist(h.pts[f[1]], w)); }
+  function keyForX(x) {                                                    // black keys answer only near their middle, so sharps are not hit by accident
+    for (var i = 0; i < keys.length; i++) { var k = keys[i], m = k.black ? 0.15 * k.w : 0; if (x >= k.x + m && x <= k.x + k.w - m) return k; }
+    return null;
+  }
   function interactKeys(now) {
-    var up = keySurf - 0.015 * H;                                          // hysteresis: lift a little above the line to release
     hands.forEach(function (h) {
-      h.kd = h.kd || {};
-      TIPS.forEach(function (ti) {
-        var p = h.pts[ti], q = h.prev ? h.prev[ti] : null, st = h.kd[ti], k;
-        if (st) {
-          if (p[1] < up) { keyNoteOff(st.key, st.v); h.kd[ti] = null; return; }
-          k = keyAt(p);
-          if (k && k !== st.key && S.keys === 'harmonium') { keyNoteOff(st.key, st.v); st.key = k; st.v = keyNoteOn(k, st.vel); }   // slide along the keys
-          return;
-        }
-        if (q && q[1] < keySurf && p[1] >= keySurf && (k = keyAt(p))) {
-          var vy = (p[1] - q[1]) / (h.dt / 1000) / H, vel = clamp(0.3 + vy * 0.45, 0.25, 1);
-          h.kd[ti] = { key: k, vel: vel, v: keyNoteOn(k, vel) };
-        }
+      h.kd = h.kd || {}; h.kb = h.kb || {}; h.kr = h.kr || {}; h.kn = (h.kn || 0) + 1;
+      var fs = FINGERS.map(function (f) {
+        var r = flexRatio(h, f), b = h.kb[f[0]];
+        if (b === undefined || r > b) b = r; else if (!h.kd[f[0]]) b = b * 0.996 + r * 0.004;   // baseline: the finger's straight length, slowly adapting
+        h.kb[f[0]] = b; return { ti: f[0], r: r, b: b };
       });
+      var fist = fs.every(function (x) { return x.r < x.b * 0.8; });        // a closed fist is a rest, not a chord
+      fs.forEach(function (x) {
+        var st = h.kd[x.ti];
+        if (st) { if (x.r > x.b * 0.88 || fist) { keyNoteOff(st.key, st.v); h.kd[x.ti] = null; } return; }
+        if (fist || h.kn < 4 || x.r >= x.b * 0.76) return;
+        var k = keyForX(h.pts[x.ti][0]); if (!k) return;
+        var pr = h.kr[x.ti] != null ? h.kr[x.ti] : x.r, rate = (pr - x.r) / x.b / (Math.max(1, h.dt) / 1000), vel = clamp(0.35 + rate * 0.15, 0.3, 1);
+        h.kd[x.ti] = { key: k, vel: vel, v: keyNoteOn(k, vel) };
+      });
+      fs.forEach(function (x) { h.kr[x.ti] = x.r; });
     });
   }
   function releaseHand(h) { if (h.kd) Object.keys(h.kd).forEach(function (ti) { var st = h.kd[ti]; if (st) keyNoteOff(st.key, st.v); }); h.kd = {}; }
@@ -530,6 +579,9 @@
     var pd = pads.filter(function (p) { return p.id === id; })[0];
     if (!ac || !pd) return;
     var t = ac.currentTime, g = ac.createGain(); g.gain.value = 0.35 + 0.65 * vel; g.connect(mkPan(pd.c[0]));
+    var buf = smpCache[drumUrl(id, vel > 0.6 ? 2 : 1)] || smpCache[drumUrl(id, vel > 0.6 ? 1 : 2)];
+    if (buf) { var src = ac.createBufferSource(); src.buffer = buf; src.playbackRate.value = 0.985 + Math.random() * 0.03; g.gain.value = 0.45 + 0.75 * vel; src.connect(g); src.start(t); return; }
+    preloadDrums();
     if (id === 'kick') { sweepTone(g, t, 'sine', 155, 48, 0.13, 1.1, 0.5); noiseHit(g, t, 'highpass', 1800, 0.7, 0.25, 0.012); }
     else if (id === 'snare') { noiseHit(g, t, 'bandpass', 1900, 0.6, 0.9, 0.24); noiseHit(g, t, 'highpass', 5000, 0.7, 0.3, 0.12); sweepTone(g, t, 'triangle', 195, 165, 0.08, 0.6, 0.14); }
     else if (id === 'hihat') { noiseHit(g, t, 'highpass', 7500, 0.8, 0.55, 0.06); noiseHit(g, t, 'bandpass', 10000, 1, 0.3, 0.05); }
@@ -541,21 +593,24 @@
     pd.t = now; playDrum(pd.id, vel); stats.plays++; stats.drums = (stats.drums || 0) + 1;
     burstAt(pd.c[0], pd.c[1], PAD_HUE[pd.id], Math.round(8 + 18 * vel), 0.35);
   }
-  /* A strike, not a drift: fast enough per second, or a big enough jump between two frames (so slow devices still work). */
-  function strikeVel(h, q, p) {
-    var sp = dist(q, p) / (h.dt / 1000) / DIAG, jump = dist(q, p) / h.s;
-    if (sp < 0.35 && jump < 0.3) return 0;
-    return clamp(Math.max(sp / 1.6, jump / 1.2), 0.25, 1);
+  /* A stroke lands when the fingertip has been moving down fast and then stops: the moment a stick meets the skin.
+     Sideways or upward movement, and slowly lowering a hand, never sound. Works at low frame rates too. */
+  function strike(h, now) {
+    var sk = h.sk || (h.sk = { peak: 0, armedAt: 0, last: 0 });
+    if (!h.rawPrev || h.hits < 3) { sk.armedAt = 0; sk.peak = 0; return null; }
+    var p = h.raw[8], q = h.rawPrev[8], dt = Math.max(0.008, h.dt / 1000), vy = (p[1] - q[1]) / dt / H, jump = (p[1] - q[1]) / h.s;
+    var downFast = vy > 1.1 || jump > 0.45, power = Math.max(vy / 3.2, jump / 1.1);
+    if (downFast) { if (!sk.armedAt) sk.armedAt = now; sk.peak = Math.max(sk.peak, power); sk.pvy = vy; return null; }
+    if (!sk.armedAt) return null;
+    if (now - sk.armedAt > Math.max(450, 5 * 1000 / Math.max(fps, 1))) { sk.armedAt = 0; sk.peak = 0; return null; }   // longer allowance on slow devices
+    if (vy < Math.max(0.45, 0.4 * (sk.pvy || 0)) && now - sk.last > 90) {
+      var vel = clamp(sk.peak, 0.25, 1); sk.armedAt = 0; sk.peak = 0; sk.last = now; return { p: p, vel: vel };
+    }
+    return null;
   }
+  function padAt(list, p, grow) { var best = null; list.forEach(function (pd) { var d = dist(p, pd.c) / pd.r; if (d <= grow && (!best || d < best.d)) best = { pd: pd, d: d }; }); return best && best.pd; }
   function interactDrums(now) {
-    hands.forEach(function (h) {
-      if (!h.prev) return;
-      [8, 12].forEach(function (ti) {
-        var q = h.prev[ti], p = h.pts[ti], vel = strikeVel(h, q, p);
-        if (!vel) return;
-        pads.forEach(function (pd) { if (circleHit(q, p, pd.c, pd.r) && now - pd.t > 80) hitPad(pd, vel, now); });
-      });
-    });
+    hands.forEach(function (h) { var s = strike(h, now); if (!s) return; var pd = padAt(pads, s.p, 1.15); if (pd && now - pd.t > 60) hitPad(pd, s.vel, now); });
   }
 
   /* ---------- tabla ---------- */
@@ -574,18 +629,49 @@
   }
   /* The dayan is tuned to Sa (the Key setting). Its black syahi makes the overtones harmonic, which is why a
      tabla sounds pitched: Na rings in the upper harmonics, Tin in the fundamental. The bayan rises as it sounds. */
+  /* Tabla strokes, rendered from the instruments' physics. C. V. Raman showed that the dayan's black syahi makes its
+     overtones harmonic (1:2:3:4:5), which is why it sounds pitched; the bayan's plain membrane has the inharmonic
+     circular-membrane modes (1 : 1.59 : 2.14 : 2.65). Each mode is [ratio, amplitude, decay time constant]. */
+  var TABLA = {
+    Na:  { bayan: false, modes: [[1, 0.12, 0.18], [2, 0.9, 0.42], [3, 0.65, 0.3], [4, 0.45, 0.22], [5, 0.3, 0.16], [6, 0.14, 0.1]], noise: ['hp', 3200, 0.009, 0.55], drop: 0.02 },
+    Tin: { bayan: false, modes: [[1, 1, 0.75], [2, 0.5, 0.5], [3, 0.28, 0.32], [4, 0.14, 0.2], [5, 0.07, 0.14]], noise: ['bp', 1600, 0.007, 0.3], drop: 0.015 },
+    Te:  { bayan: false, modes: [[1, 0.55, 0.045], [2, 0.32, 0.035], [3, 0.2, 0.03]], noise: ['bp', 1200, 0.02, 0.75], drop: 0 },
+    Ge:  { bayan: true, modes: [[1, 1, 0.75], [1.59, 0.22, 0.3], [2.14, 0.13, 0.2], [2.65, 0.07, 0.14]], noise: ['lp', 420, 0.012, 0.5], rise: 0.12 },
+    Ke:  { bayan: true, modes: [[1, 0.55, 0.05], [1.59, 0.3, 0.04]], noise: ['lp', 520, 0.028, 0.9], drop: 0 }
+  };
+  var tablaCache = {};
+  function biquadCoef(type, f, q, sr) {                                    // RBJ cookbook filters, for shaping the strike noise
+    var w = 2 * Math.PI * f / sr, cs = Math.cos(w), al = Math.sin(w) / (2 * q), b;
+    if (type === 'lp') b = [(1 - cs) / 2, 1 - cs, (1 - cs) / 2]; else if (type === 'hp') b = [(1 + cs) / 2, -(1 + cs), (1 + cs) / 2]; else b = [al, 0, -al];
+    var a0 = 1 + al; return [b[0] / a0, b[1] / a0, b[2] / a0, -2 * cs / a0, (1 - al) / a0];
+  }
+  function tablaBuffer(bol) {
+    var key = bol + '|' + S.key; if (tablaCache[key]) return tablaCache[key];
+    var T = TABLA[bol], sr = ac.sampleRate, f0 = T.bayan ? mtof(60 + S.key) / 3.2 : mtof(60 + S.key);
+    var dur = 0.05 + Math.max.apply(null, T.modes.map(function (m) { return m[2]; })) * 5, n = Math.floor(sr * dur), out = new Float32Array(n), i;
+    T.modes.forEach(function (m) {
+      var ph = Math.random() * 6.283, amp = m[1], d = Math.exp(-1 / (m[2] * sr));
+      for (i = 0; i < n; i++) {
+        var t = i / sr, ratio = T.rise ? 1 + T.rise * (1 - Math.exp(-t / 0.08)) : 1 + (T.drop || 0) * Math.exp(-t / 0.02);   // bayan rises, dayan settles
+        ph += 2 * Math.PI * f0 * m[0] * ratio / sr; out[i] += amp * Math.sin(ph); amp *= d;
+      }
+    });
+    var c = biquadCoef(T.noise[0], T.noise[1], 0.8, sr), x1 = 0, x2 = 0, y1 = 0, y2 = 0, nn = Math.floor(sr * T.noise[2] * 4);   // the finger striking the skin
+    for (i = 0; i < nn && i < n; i++) {
+      var x = Math.random() * 2 - 1, y = c[0] * x + c[1] * x1 + c[2] * x2 - c[3] * y1 - c[4] * y2;
+      x2 = x1; x1 = x; y2 = y1; y1 = y; out[i] += T.noise[3] * 2.5 * y * Math.exp(-i / (sr * T.noise[2]));
+    }
+    var peak = 0, att = Math.floor(sr * 0.001); for (i = 0; i < n; i++) peak = Math.max(peak, Math.abs(out[i]));
+    for (i = 0; i < n; i++) { out[i] *= 0.9 / (peak || 1); if (i < att) out[i] *= i / att; }
+    var b = ac.createBuffer(1, n, sr); b.getChannelData(0).set(out);
+    return (tablaCache[key] = b);
+  }
   function playTabla(bol, vel, x) {
     if (!ac) return null;
-    var t = ac.currentTime, f = mtof(60 + S.key), fb = f / 3.2, g = ac.createGain(); g.gain.value = 0.55 + 0.45 * vel; g.connect(mkPan(x));
-    if (bol === 'Na') { modal(f, [[1, 0.3, 0.12], [2, 0.8, 0.22], [3, 0.5, 0.16], [4, 0.35, 0.12], [5, 0.2, 0.08]], 0.5, g, t); noiseHit(g, t, 'highpass', 2500, 0.7, 0.25, 0.03); }
-    else if (bol === 'Tin') modal(f, [[1, 0.9, 0.35], [2, 0.45, 0.25], [3, 0.2, 0.18], [4, 0.1, 0.1]], 0.5, g, t);
-    else if (bol === 'Te') { modal(f, [[1, 0.5, 0.025], [2.6, 0.25, 0.02]], 0.6, g, t); noiseHit(g, t, 'bandpass', 1600, 1.2, 0.35, 0.05); }
-    else if (bol === 'Ke') { noiseHit(g, t, 'lowpass', 380, 0.8, 0.8, 0.09); modal(fb * 1.1, [[1, 0.5, 0.025]], 0.8, g, t); }
-    else if (bol === 'Ge') {
-      var o = sweepTone(g, t, 'sine', fb, fb * 1.18, 0.22, 0.9, 1.6), o2 = sweepTone(g, t, 'sine', fb * 2, fb * 2.36, 0.22, 0.16, 1.2);
-      noiseHit(g, t, 'lowpass', 300, 0.7, 0.3, 0.04);
-      return { set: function (ratio) { var tt = ac.currentTime; [[o, 1.18], [o2, 2.36]].forEach(function (z) { z[0].frequency.cancelScheduledValues(tt); z[0].frequency.setTargetAtTime(fb * z[1] * ratio, tt, 0.04); }); } };
-    }
+    var t = ac.currentTime, src = ac.createBufferSource(), lpf = ac.createBiquadFilter(), g = ac.createGain();
+    src.buffer = tablaBuffer(bol); lpf.type = 'lowpass'; lpf.frequency.value = 2500 + 9000 * vel; g.gain.value = 0.4 + 0.6 * vel;
+    src.connect(lpf); lpf.connect(g); g.connect(mkPan(x)); src.start(t);
+    if (bol === 'Ge') return { set: function (ratio) { src.playbackRate.setTargetAtTime(ratio, ac.currentTime, 0.04); } };   // meend
     return null;
   }
   function hitTabla(pd, bol, vel, now, h) {
@@ -596,6 +682,7 @@
     lastBol[bol] = now;
     var v = playTabla(bol, vel, pd.c[0]);
     if (v && h) geVoice = { set: v.set, hand: h.id, y0: h.pts[0][1], t0: now, lift: 0, last: 1 };
+    if (v && !h) geVoice = null;
     labels.push({ x: pd.c[0], y: pd.c[1] - pd.r * 0.25, text: shown, t0: now, hue: pd.id === 'bayan' || pd.id === 'ke' ? 30 : 50 });
     burstAt(pd.c[0], pd.c[1], 40, Math.round(6 + 12 * vel), 0.25);
     stats.plays++; stats.tabla = (stats.tabla || 0) + 1; stats.lastBol = shown;
@@ -603,14 +690,9 @@
   function tablaBol(pd, p) { return pd.id === 'dayan' ? (dist(p, pd.c) < 0.5 * pd.r ? 'Tin' : 'Na') : pd.bol; }   // dayan: black centre rings (Tin), the rim is sharp (Na)
   function interactTabla(now) {
     hands.forEach(function (h) {
-      if (!h.prev) return;
-      [8, 12].forEach(function (ti) {
-        var q = h.prev[ti], p = h.pts[ti], vel = strikeVel(h, q, p);
-        if (!vel) return;
-        var hit = null;                                                    // one stroke sounds one bol: the pad where the fingertip lands
-        tpads.forEach(function (pd) { if (circleHit(q, p, pd.c, pd.r) && now - pd.t > 80 && (!hit || dist(p, pd.c) / pd.r < dist(p, hit.c) / hit.r)) hit = pd; });
-        if (hit) hitTabla(hit, tablaBol(hit, p), vel, now, hit.id === 'bayan' ? h : null);
-      });
+      var s = strike(h, now); if (!s) return;
+      var pd = padAt(tpads, s.p, 1.12); if (!pd || now - pd.t < 60) return;
+      hitTabla(pd, tablaBol(pd, s.p), s.vel, now, pd.id === 'bayan' ? h : null);
     });
     if (geVoice) {                                                         // meend: lift the hand that struck the bayan to bend its pitch upward
       var gh = hands.filter(function (h) { return h.id === geVoice.hand; })[0];
@@ -671,10 +753,26 @@
       ctx.fillStyle = key.on ? 'rgba(61,220,151,.95)' : 'rgba(12,14,20,.86)'; rrect(key.x, key.y, key.w, key.h, 5 * k); ctx.fill();
       ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 1 * k; rrect(key.x, key.y, key.w, key.h, 5 * k); ctx.stroke();
     });
-    ctx.strokeStyle = 'rgba(61,220,151,.9)'; ctx.lineWidth = 2.5 * k; ctx.beginPath(); ctx.moveTo(0, keySurf); ctx.lineTo(W, keySurf); ctx.stroke();
-    ctx.strokeStyle = 'rgba(61,220,151,.25)'; ctx.lineWidth = 9 * k; ctx.beginPath(); ctx.moveTo(0, keySurf); ctx.lineTo(W, keySurf); ctx.stroke();
+    ctx.strokeStyle = 'rgba(61,220,151,.6)'; ctx.lineWidth = 2 * k; ctx.beginPath(); ctx.moveTo(0, keySurf); ctx.lineTo(W, keySurf); ctx.stroke();
+    seenHands().forEach(function (h) {                                     // where each finger is aiming, and how far it is bent
+      FINGERS.forEach(function (f) {
+        var x = h.pts[f[0]][0], key = keyForX(x), on = h.kd && h.kd[f[0]], b = h.kb && h.kb[f[0]], bend = b ? clamp((1 - flexRatio(h, f) / b) / 0.24, 0, 1) : 0;
+        if (!key) return;
+        ctx.fillStyle = on ? 'rgba(61,220,151,.95)' : 'rgba(255,255,255,' + (0.35 + 0.5 * bend) + ')';
+        ctx.beginPath(); ctx.moveTo(x, keySurf + 4 * k); ctx.lineTo(x - 7 * k, keySurf - 9 * k); ctx.lineTo(x + 7 * k, keySurf - 9 * k); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,' + (0.15 + 0.35 * bend) + ')'; ctx.lineWidth = 1 * k; ctx.setLineDash([3 * k, 4 * k]);
+        ctx.beginPath(); ctx.moveTo(x, h.pts[f[0]][1]); ctx.lineTo(x, keySurf - 10 * k); ctx.stroke(); ctx.setLineDash([]);
+      });
+    });
   }
   function disc(c, r) { ctx.beginPath(); ctx.arc(c[0], c[1], r, 0, 6.283); }
+  function drawAim(k) {                                                    // the striking fingertip; fills while a stroke is on its way down
+    seenHands().forEach(function (h) {
+      var p = h.pts[8], armed = h.sk && h.sk.armedAt;
+      ctx.strokeStyle = armed ? 'rgba(255,220,120,1)' : 'rgba(255,255,255,.8)'; ctx.lineWidth = 2.5 * k; disc(p, 13 * k); ctx.stroke();
+      if (armed) { ctx.fillStyle = 'rgba(255,220,120,.55)'; disc(p, 13 * k); ctx.fill(); }
+    });
+  }
   function drawPads(now, k) {
     pads.forEach(function (pd) {
       var f = Math.max(0, 1 - (now - pd.t) / 300), hue = PAD_HUE[pd.id], cym = pd.id === 'hihat' || pd.id === 'crash' || pd.id === 'ride';
@@ -904,7 +1002,7 @@
     else if (S.mode === 'strings') strings.forEach(function (s) { drawString(s, now, k); });
     else {
       ctx.globalCompositeOperation = 'source-over';
-      if (S.mode === 'keys') drawKeys(now, k); else if (S.mode === 'drums') drawPads(now, k); else if (S.mode === 'tabla') drawTabla(now, k); else drawTheremin(now, k);
+      if (S.mode === 'keys') drawKeys(now, k); else if (S.mode === 'drums') { drawPads(now, k); drawAim(k); } else if (S.mode === 'tabla') { drawTabla(now, k); drawAim(k); } else drawTheremin(now, k);
       ctx.globalCompositeOperation = 'lighter';
     }
     for (var i = particles.length - 1; i >= 0; i--) {
@@ -937,9 +1035,9 @@
   function pill() { var n = seenHands().length; $('pill').textContent = !ready ? 'loading…' : (running ? (fps < 10 ? fps.toFixed(1) : fps.toFixed(0)) + ' fps · ' + n + (n === 1 ? ' hand' : ' hands') : 'ready'); }
   function hint() {
     var any = seenHands().length;
-    if (S.mode === 'keys') return any ? 'Tap a fingertip down across the green line to play. Lift it to release.' : 'Hold your hands up so the fingertips are above the green line.';
-    if (S.mode === 'drums') return any ? 'Strike the pads with quick fingertip movements.' : 'Show your hands to the camera, then strike the pads.';
-    if (S.mode === 'tabla') return any ? 'Dayan: rim for Na, black centre for Tin. Bayan for Ge, then lift to bend it.' : 'Show both hands to the camera.';
+    if (S.mode === 'keys') return any ? 'Bend a finger to press the key it points at. Straighten it to let go.' : 'Hold your hands up, fingers straight, above the keyboard.';
+    if (S.mode === 'drums') return any ? 'Strike down at a pad and stop sharply, like a drumstick.' : 'Show your hands to the camera, then strike down at the pads.';
+    if (S.mode === 'tabla') return any ? 'Strike down and stop: dayan rim for Na, black centre for Tin, bayan for Ge.' : 'Show both hands to the camera.';
     if (S.mode === 'theremin') return any ? 'Raise the ' + (S.lefty ? 'left' : 'right') + '-side hand for higher notes; the other hand sets the volume.' : 'Show your hands to the camera.';
     if (S.mode === 'strum') return hands.length ? 'Point at a chord with one hand. Sweep the other hand’s fingers across the strings.' : 'Show both hands to the camera.';
     if (!seenHands().length) return 'Show your hands to the camera, palms facing it, in good light.';
@@ -1022,11 +1120,11 @@
   function renderHelp() {
     var h = $('help'), side = S.lefty ? 'left' : 'right', other = S.lefty ? 'right' : 'left';
     var HELP = {
-      keys: '<p><b>Play:</b> hold your hands above the keyboard and tap a fingertip down so it crosses the green line. Each finger plays its own key, so chords work, and a faster tap plays louder. Lift the finger above the line to let go.</p>' +
-        '<p><b>Harmonium</b> holds the note while your finger stays down, and sliding along the keys moves between notes. <b>Piano</b> rings like a real one; turn on Sustain pedal to let notes ring after you lift. On a touch screen, press the keys directly.</p>',
-      drums: '<p><b>Play:</b> strike a pad with a quick flick of a fingertip, as if holding sticks. A faster strike plays louder. Each pad needs a fresh strike from outside it.</p><p>On a touch screen, tap the pads.</p>',
+      keys: '<p><b>Play:</b> hold your hands up, fingers straight, above the keyboard. Each finger’s position picks a key, marked on the keyboard. <b>Bend a finger</b> to press its key, as on a real keyboard, and straighten it to let go. Several fingers make a chord; a quicker bend plays louder. A closed fist is silent.</p>' +
+        '<p><b>Piano</b> is a recorded Steinway grand. <b>Harmonium</b> holds the note while the finger stays bent. Turn on Sustain pedal to let piano notes ring. On a touch screen, press the keys directly.</p>',
+      drums: '<p><b>Play:</b> strike down at a pad with your index finger, as if holding a stick, and stop sharply. The hit lands where your stroke stops; a faster stroke plays louder. Moving sideways, upward or slowly makes no sound.</p><p>The kit is a recorded jazz drum kit. On a touch screen, tap the pads.</p>',
       tabla: '<p><b>Dayan</b> (' + side + '): strike the rim for <b>Na</b>, the black centre for <b>Tin</b>, and the small pad beside it for <b>Te</b>. <b>Bayan</b> (' + other + '): strike it for <b>Ge</b>, the small pad for <b>Ke</b>. Na or Tin with Ge at the same moment sound <b>Dha</b> or <b>Dhin</b>.</p>' +
-        '<p><b>Meend:</b> after a Ge, lift that hand to bend the bayan’s pitch upward. The dayan is tuned to Sa, set by Key. Left-handed swaps the drums.</p>',
+        '<p><b>Play:</b> strike down with your index finger and stop sharply on the spot. <b>Meend:</b> after a Ge, lift that hand to bend the bayan’s pitch upward. The dayan is tuned to Sa, set by Key. Left-handed swaps the drums.</p>',
       theremin: '<p><b>Pitch:</b> your ' + side + '-side hand sets the note. Raise its index finger for higher notes, along the scale drawn on the ' + side + '. <b>Volume:</b> raise your other hand for louder. With one hand only, the volume stays medium.</p>' +
         '<p>With Snap to scale on, the pitch glides from note to note of the chosen scale or raag. Turn it off for a fully continuous, singing pitch. On a touch screen, drag up and down.</p>'
     };
@@ -1045,7 +1143,8 @@
       var el = $(p[0]); el.value = String(S[p[1]]);
       el.addEventListener('change', function () {
         S[p[1]] = p[1] === 'key' || p[1] === 'octave' ? parseInt(el.value, 10) : el.value; saveS();
-        if (p[1] === 'keys' || p[1] === 'octave') { releaseAll(); layoutKeys(); prewarm(); }
+        if (p[1] === 'keys' || p[1] === 'octave') { releaseAll(); layoutKeys(); prewarm(); preloadPiano(); }
+        if (p[1] === 'key') tablaCache = {};
         if (p[1] === 'tone') { bufCache = {}; cacheKeys = []; applyTone(); }
         if (p[1] === 'scale' || p[1] === 'key') retune();
         if (p[1] === 'chords') { chordIdx = 0; layoutStrum(); }
@@ -1086,7 +1185,7 @@
   window.AirGuitar = {   // for testing
     feed: function (dets, t) { processHands(dets, t || performance.now()); }, hold: function (v) { testHold = v; }, setSize: setSize,
     get hands() { return hands; }, get strings() { return strings; }, get strum() { return strum; }, get live() { return live; },
-    get chord() { return CHORD_SETS[S.chords][chordIdx]; }, get keys() { return keys; }, get keySurf() { return keySurf; }, get pads() { return pads; }, get tpads() { return tpads; }, get geVoice() { return geVoice; }, get ther() { return therState; }, setMode: setMode, stats: stats, S: S, get human() { return human; }, get engine() { return engine; },
+    get chord() { return CHORD_SETS[S.chords][chordIdx]; }, get keys() { return keys; }, get keySurf() { return keySurf; }, get pads() { return pads; }, get tpads() { return tpads; }, get geVoice() { return geVoice; }, get ther() { return therState; }, setMode: setMode, get smp() { return Object.keys(smpCache); }, stats: stats, S: S, get human() { return human; }, get engine() { return engine; },
     lengthToMidi: lengthToMidi, initAudio: initAudio, ksBuffer: function (f, u, v) { initAudio(); return ksBuffer(f, u, v); }, get ac() { return ac; }
   };
 })();
