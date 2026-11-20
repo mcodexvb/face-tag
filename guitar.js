@@ -626,7 +626,7 @@
     try { await initEngine(); status('Ready. Press Start, or play by touch.'); }
     catch (e) { status('Hand tracking could not load: ' + (e && e.message ? e.message : e) + '. You can still play by touch.', 'bad'); }
   })();
-  if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) navigator.serviceWorker.register('sw.js').catch(function () {});
+  if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) navigator.serviceWorker.register('sw.js').then(function (r) { r.update(); }).catch(function () {});
 
   window.AirGuitar = {   // for testing
     feed: function (dets, t) { processHands(dets, t || performance.now()); }, hold: function (v) { testHold = v; }, setSize: setSize,

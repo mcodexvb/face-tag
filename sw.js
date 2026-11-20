@@ -1,5 +1,5 @@
 /* Offline cache for Face Tag. Models and the engine are cached after first use. */
-var VERSION = 'facetag-v5';
+var VERSION = 'facetag-v6';
 var CORE = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'lib/human.js', 'air-guitar.html', 'guitar.js'];
 
 self.addEventListener('install', function (e) {
@@ -19,7 +19,7 @@ self.addEventListener('fetch', function (e) {
       return hit || fetch(req).then(function (r) { var c = r.clone(); caches.open(VERSION).then(function (ch) { ch.put(req, c); }); return r; });
     }));
   } else {                                       // network first, fall back to cache when offline
-    e.respondWith(fetch(req).then(function (r) { var c = r.clone(); caches.open(VERSION).then(function (ch) { ch.put(req, c); }); return r; })
+    e.respondWith(fetch(req, { cache: 'no-cache' }).then(function (r) { var c = r.clone(); caches.open(VERSION).then(function (ch) { ch.put(req, c); }); return r; })   // always check the server for newer code
       .catch(function () { return caches.match(req).then(function (h) { return h || caches.match('index.html'); }); }));
   }
 });
